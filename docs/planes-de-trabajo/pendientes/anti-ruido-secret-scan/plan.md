@@ -40,13 +40,21 @@
 
 | Fase | Descripcion | Estado |
 |------|-------------|--------|
-| 1 | Excluir ramas efimeras (`pull_request`, `merge_group`) del modo "abrir Issue" | Pendiente |
-| 2 | Dedup por fingerprint real del hallazgo (detector+file+line+commit), no por titulo | Pendiente |
-| 3 | `core.setFailed` cuando sobrevive un hallazgo real (`findings`), no solo en `tool_error` | Pendiente |
-| 4 | PR abierto, CI verde, verificacion manual de los 3 escenarios | Pendiente |
+| 1 | Excluir ramas efimeras (`pull_request`, `merge_group`) del modo "abrir Issue" | Completada |
+| 2 | Dedup por fingerprint real del hallazgo (detector+file+line+commit), no por titulo | Completada |
+| 3 | `core.setFailed` cuando sobrevive un hallazgo real (`findings`), no solo en `tool_error` | Completada |
+| 4 | PR abierto, verificacion (harness mockeado, 7/7 escenarios), revision /revisar-pr (2 Codex) | En Progreso — falta smoke post-merge en vivo |
 
 **Checklist de archivos:**
-- [ ] `.github/workflows/secret-scan.yml` (unico archivo a tocar — reusable de la org)
+- [x] `.github/workflows/secret-scan.yml` (unico archivo a tocar — reusable de la org)
+
+**Fixes adicionales aplicados tras revision `/revisar-pr` (2 Codex, Seguridad + Calidad, ambos convergieron en los mismos 4 hallazgos):**
+- [x] `core.setFailed` tambien cuando `exit 183` pero el JSONL no es parseable (fail-open pre-existente que contradecia la Fase 3 — antes quedaba en `core.warning` sin fallar el check)
+- [x] Dedup de Issues con `github.paginate` en vez de `per_page: 50` fijo (la Fase 2 decia "TODOS los Issues", `per_page` fijo solo cubria la primera pagina)
+- [x] Fingerprint calculado con el commit COMPLETO (`commitFull`), no el SHA truncado a 8 chars usado para mostrar en la tabla
+- [x] Este plan actualizado (hallazgo MEDIO de ambos Codex: el estado seguia en `Pendiente` pese a la implementacion)
+
+**Pendiente antes de dar la Fase 4 por completada — smoke post-merge en vivo (ver seccion "Verificacion post-merge" mas abajo).**
 
 ---
 
@@ -93,6 +101,23 @@ Ademas, hoy ningun run con `result === 'findings'` llama `core.setFailed` (solo 
 - Commit + push del branch de trabajo, PR normal contra `main` (el repo `.github` hoy no tiene merge queue).
 - Verificar en un run real (o simulacion controlada): rama efimera no abre Issue; hallazgo duplicado no re-abre; hallazgo real → check rojo (`setFailed`) visible como `workflow_run_failed`.
 - Reportar a la sesion maestra y esperar señal de merge.
+
+**Verificacion pre-merge realizada:** `.github` no tiene ningun workflow que se dispare sobre si mismo (`secret-scan.yml`/`update-docs.yml` son ambos `workflow_call` puros) — no hay CI que ejecutar contra el PR. En su lugar se armo un harness (`node`, en `/private/tmp/.../scratchpad/verify_secret_scan.mjs`, no versionado) que corre el bloque JS real extraido del YAML contra `context`/`core`/`github` mockeados. 7/7 escenarios pasan: rama efimera (`pull_request` y `merge_group`) con hallazgo → sin Issue + check rojo + detalle en Job Summary; duplicado por fingerprint en rama no-efimera → comenta, no re-abre; mismo titulo viejo con fingerprint distinto → SI abre (confirma que el bug de dedup-por-titulo esta resuelto); hallazgo real sin duplicado → abre Issue Y falla el check; `tool_error` en rama efimera → sin Issue, check rojo igual; `findings` sin JSON parseable → check rojo (fix post-revision, ver abajo). No se dispara ningun secreto real ni se toca ningun repo de produccion para esto.
+
+### Verificacion post-merge (smoke en vivo)
+
+El harness mockeado prueba la LOGICA; falta confirmar el comportamiento real contra la API de GitHub. Candidatos entre los repos que usan `@main` flotante (reciben el fix apenas se mergee este PR, sin esperar bump de pin — ver `TSK-20260809T050130-sejf`):
+
+| Repo | Trigger de su `secret-scan.yml` | Que valida |
+|---|---|---|
+| `tablero-equipo` | `pull_request` | Rama efimera → sin Issue nuevo, check rojo si hay hallazgo/tool_error |
+| `recursos-compartidos`, `planeacion-por-escenarios-1` | `push` | Rama no-efimera → Issue con marcador de fingerprint; dedup en el segundo hallazgo identico |
+
+**Plan pasivo (default, sin tocar nada mas):** en las proximas 1-2 rondas de `/merge-watchdog`, filtrar `gh run list --workflow "Secret Scan" --json conclusion,event,createdAt` sobre esos repos por `conclusion=failure`. Cuando aparezca uno: si `event` es `pull_request`/`merge_group` → confirmar en GitHub que NO se abrio Issue nuevo; si es `push` → confirmar que el Issue tiene `<!-- secret-scan-fingerprint: ... -->` en el body, y que una recurrencia comenta en vez de re-abrir.
+
+**Plan activo (opcional, requiere luz verde explicita — NO ejecutado unilateralmente):** `recursos-compartidos` tiene funciones de test reales que matcheaban el detector `Lob` (el falso positivo que origino el fix de `exclude_detectors`, ya excluido por default). Correr manualmente el workflow via `workflow_dispatch` pasando `exclude_detectors: ""` sobre una PR descartable forzaria un finding determinista sin usar ningun secreto real. No se hizo aqui porque implica destapar deliberadamente un detector ruidoso en un repo compartido — decision de David/maestra, no de esta sesion.
+
+La validacion definitiva del incidente original (11 Issues en `agente-de-monitoreo` via Merge Queue) solo llega cuando `TSK-20260809T205433-d5p5` (bump de pin en los 4 repos pineados) se complete — ese repo es el unico que reproduce exactamente el escenario que origino esta tarea.
 
 ## Criterios de Exito
 
