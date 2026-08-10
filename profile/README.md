@@ -1,3 +1,4 @@
+<!-- [MQ ROLLOUT - ignorar] comment-only, captura de check-run F5.0b (plan merge-queue-global) — se revierte tras el ciclo. -->
 # Información Organización
 ## Esta es la organización de FaroNova para desarrollo de sus productos.
 
