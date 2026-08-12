@@ -11,6 +11,17 @@ name: Dependabot Auto-merge
 #   - patch y minor -> entran solos. Actualizaciones de seguridad tambien,
 #     SIEMPRE QUE no sean major (ver nota de desempate abajo).
 #   - major -> se queda esperando a una persona. No se auto-mergea nunca.
+#   - cualquier valor que NO sea explicitamente patch o minor (major, vacio,
+#     desconocido, error del action) -> espera a una persona. Lista BLANCA,
+#     no lista negra: fail-closed, no fail-open. Esto no es cosmetica —
+#     una version anterior de este archivo comparaba
+#     `update-type != semver-major`, que es cierto tambien cuando
+#     `update-type` viene VACIO (dato empirico de BAR1: en esta org
+#     `fetch-metadata` a veces no devuelve `update-type` en absoluto), asi que
+#     esa version auto-mergeaba TODO, majors incluidos. Corregido antes de
+#     probarlo contra un PR real — ver el paso "Log crudo" abajo, que deja el
+#     valor LITERAL en el Job Summary para no repetir el error de confiar en
+#     la documentacion en vez del dato real.
 #
 # DESEMPATE PENDIENTE DE CONFIRMACION DE DAVID (default conservador, 2026-08-12,
 # via sesion maestra R19): un bump de seguridad que ademas es major cae en las
@@ -19,9 +30,18 @@ name: Dependabot Auto-merge
 # workflow trata "major" como el guardarrail que manda SIEMPRE, tenga o no
 # alerta de seguridad asociada — la asimetria de riesgo es: un security-major
 # retenido cuesta horas de espera; un security-major auto-mergeado que rompe
-# produccion de madrugada, sin nadie mirando, cuesta mucho mas. Si David
-# decide que los security-major SI deben entrar solos, invertir es UNA linea:
-# cambiar la condicion de `gate` de abajo para volver a incluir `$GHSA_ID`.
+# produccion de madrugada, sin nadie mirando, cuesta mucho mas.
+#
+# GRUPOS (Dependabot agrupa varias dependencias en un solo PR, ej.
+# "security-npm"): un grupo se mergea ENTERO o no se mergea — si UNA sola
+# dependencia del grupo es major, el grupo completo espera. Documentacion de
+# `dependabot/fetch-metadata` dice que `update-type` es "el cambio semver mas
+# alto" del PR, lo que ya cubriria esto — pero dado el hallazgo de BAR1 sobre
+# `update-type` ausente en esta org, NO se asume: el paso "Log crudo" imprime
+# tambien `updated-dependencies-json` completo (una entrada por dependencia,
+# con su propio `update-type`) para poder confirmar con el dato real de un
+# grupo mixto (caso conocido: `tablero-equipo#279` trae `vite` y `vitest`
+# como majors dentro de un grupo "security-npm").
 #
 # Alcance: SOLO PRs de `dependabot[bot]`. Bots que no son Dependabot
 # (ej. propagadores internos, workflows de sincronizacion) no tienen
@@ -70,23 +90,50 @@ jobs:
           # exige tratarlos distinto.
           alert-lookup: true
 
+      - name: Log crudo (evidencia — NO confiar en la doc, mirar el dato real)
+        env:
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          DIRECTORY: ${{ steps.metadata.outputs.directory }}
+          GHSA_ID: ${{ steps.metadata.outputs.ghsa-id }}
+          DEPS_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
+        run: |
+          {
+            echo "## fetch-metadata — valores literales"
+            echo '```'
+            echo "update-type: '${UPDATE_TYPE}'"
+            echo "dependency-names: '${DEP_NAMES}'"
+            echo "directory: '${DIRECTORY}'"
+            echo "ghsa-id: '${GHSA_ID}'"
+            echo "updated-dependencies-json:"
+            echo "${DEPS_JSON}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::update-type='${UPDATE_TYPE}' dependency-names='${DEP_NAMES}'"
+
       - name: Decidir elegibilidad
         id: gate
         env:
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           GHSA_ID: ${{ steps.metadata.outputs.ghsa-id }}
         run: |
-          # `major` manda siempre — ver nota de desempate pendiente arriba.
+          # LISTA BLANCA explicita, no lista negra — ver nota arriba sobre por
+          # que (`!= major` es fail-open cuando update-type viene vacio).
+          # Cualquier valor que no sea EXACTAMENTE patch o minor espera a una
+          # persona: major, vacio, desconocido, o un error del action.
           # $GHSA_ID queda calculado (no se usa en la condicion todavia) para
-          # que invertir el desempate, si David lo pide, sea agregar
-          # `|| [ -n "${GHSA_ID}" ]` a la condicion, no reescribir el paso.
-          if [ "${UPDATE_TYPE}" != "version-update:semver-major" ]; then
-            echo "eligible=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Elegible para auto-merge (update-type=${UPDATE_TYPE})."
-          else
-            echo "eligible=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::NO elegible — major (update-type=${UPDATE_TYPE}, ghsa-id=${GHSA_ID:-ninguno}). Se deja para revision humana, incluso si es un fix de seguridad — desempate pendiente de confirmacion de David."
-          fi
+          # que invertir el desempate de security-major, si David lo pide,
+          # sea agregar una rama a este `case`, no reescribir el paso.
+          case "${UPDATE_TYPE}" in
+            version-update:semver-patch|version-update:semver-minor)
+              echo "eligible=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::Elegible para auto-merge (update-type=${UPDATE_TYPE})."
+              ;;
+            *)
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::NO elegible — update-type='${UPDATE_TYPE}' (ghsa-id=${GHSA_ID:-ninguno}) no esta en la lista blanca (patch/minor). Se deja para revision humana."
+              ;;
+          esac
 
       - name: Habilitar auto-merge
         if: steps.gate.outputs.eligible == 'true'
