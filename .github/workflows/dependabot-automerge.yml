@@ -23,14 +23,25 @@ name: Dependabot Auto-merge
 #     valor LITERAL en el Job Summary para no repetir el error de confiar en
 #     la documentacion en vez del dato real.
 #
-# DESEMPATE PENDIENTE DE CONFIRMACION DE DAVID (default conservador, 2026-08-12,
-# via sesion maestra R19): un bump de seguridad que ademas es major cae en las
-# dos reglas de la frase original de David a la vez ("security entra sola" vs
-# "major espera a una persona"). Mientras el no confirme cual gana, este
-# workflow trata "major" como el guardarrail que manda SIEMPRE, tenga o no
-# alerta de seguridad asociada — la asimetria de riesgo es: un security-major
-# retenido cuesta horas de espera; un security-major auto-mergeado que rompe
-# produccion de madrugada, sin nadie mirando, cuesta mucho mas.
+# DESEMPATE CONFIRMADO POR D-027 (David, 12-ago-2026): un bump de seguridad
+# que ademas es major cae en las dos reglas de la frase original de David a
+# la vez ("security entra sola" vs "major espera a una persona"). El default
+# conservador que dejo la sesion maestra R19 el mismo dia (major manda
+# SIEMPRE, tenga o no alerta de seguridad asociada) es EXACTAMENTE lo que
+# D-027 confirmo — no hizo falta cambiar una linea de la logica, solo dejar
+# de llamarlo "pendiente". La asimetria de riesgo que motivo el default sigue
+# siendo la razon: un security-major retenido cuesta horas de espera; uno
+# auto-mergeado que rompe produccion de madrugada, sin nadie mirando, cuesta
+# mucho mas.
+#
+# Que pasa despues de quedar excluido (D-027): no se queda esperando a que
+# alguien lo note. La pasada de `/merge-watchdog` (2x/dia, repo
+# recursos-compartidos) lo resuelve en la misma corrida — Paso 2bis de
+# `.claude/commands/merge-watchdog.md`: analiza los breaking changes contra
+# el uso real, mergea con evidencia si no afecta, arregla y mergea si afecta,
+# o deja una TSK con diagnostico + plan si el arreglo es grande. Un major SIN
+# alerta de seguridad sigue esperando a una persona sin fecha limite (U9 de
+# ese mismo comando).
 #
 # GRUPOS (Dependabot agrupa varias dependencias en un solo PR, ej.
 # "security-npm"): un grupo se mergea ENTERO o no se mergea — si UNA sola
@@ -129,14 +140,25 @@ jobs:
           # LISTA BLANCA explicita, no lista negra — ver nota arriba sobre por
           # que (`!= major` es fail-open cuando update-type viene vacio).
           # Cualquier valor que no sea EXACTAMENTE patch o minor espera a una
-          # persona: major, vacio, desconocido, o un error del action.
-          # $GHSA_ID queda calculado (no se usa en la condicion todavia) para
-          # que invertir el desempate de security-major, si David lo pide,
-          # sea agregar una rama a este `case`, no reescribir el paso.
+          # persona: major, vacio, desconocido, o un error del action. El
+          # RESULTADO (eligible=true/false) es identico al de antes de D-027
+          # para TODO valor de UPDATE_TYPE — lo unico que cambia es el
+          # `::notice::` de la rama major, para distinguir el caso
+          # security-major (D-027: lo resuelve /merge-watchdog, no espera
+          # indefinidamente) del major sin seguridad asociada (sigue
+          # esperando a una persona, sin cambios).
           case "${UPDATE_TYPE}" in
             version-update:semver-patch|version-update:semver-minor)
               echo "eligible=true" >> "$GITHUB_OUTPUT"
               echo "::notice::Elegible para auto-merge (update-type=${UPDATE_TYPE})."
+              ;;
+            version-update:semver-major)
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              if [ -n "${GHSA_ID}" ]; then
+                echo "::notice::NO elegible — security-major (update-type=${UPDATE_TYPE}, ghsa-id=${GHSA_ID}). D-027: lo resuelve /merge-watchdog en su proxima pasada (Paso 2bis de merge-watchdog.md), no espera a una persona sin fecha."
+              else
+                echo "::notice::NO elegible — major sin alerta de seguridad asociada (update-type=${UPDATE_TYPE}). Espera a una persona (U9 de /merge-watchdog)."
+              fi
               ;;
             *)
               echo "eligible=false" >> "$GITHUB_OUTPUT"
