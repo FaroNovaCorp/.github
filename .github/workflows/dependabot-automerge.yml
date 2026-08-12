@@ -1,0 +1,99 @@
+name: Dependabot Auto-merge
+
+# Reusable workflow — aprieta el boton que Dependabot no aprieta.
+#
+# Merge Queue != auto-merge: la cola dice "es seguro mergear", esto dice
+# "alguien quiere que esto entre". Sin este workflow no existe en ningun repo
+# el paso que decide POR QUIEN se aprueba un PR de Dependabot.
+#
+# Criterio (decidido por David, TSK-20260812T055522-8dyl — no cambiar aqui,
+# escalar si se cree que deberia ser otro):
+#   - patch y minor -> entran solos. Actualizaciones de seguridad tambien,
+#     SIEMPRE QUE no sean major (ver nota de desempate abajo).
+#   - major -> se queda esperando a una persona. No se auto-mergea nunca.
+#
+# DESEMPATE PENDIENTE DE CONFIRMACION DE DAVID (default conservador, 2026-08-12,
+# via sesion maestra R19): un bump de seguridad que ademas es major cae en las
+# dos reglas de la frase original de David a la vez ("security entra sola" vs
+# "major espera a una persona"). Mientras el no confirme cual gana, este
+# workflow trata "major" como el guardarrail que manda SIEMPRE, tenga o no
+# alerta de seguridad asociada — la asimetria de riesgo es: un security-major
+# retenido cuesta horas de espera; un security-major auto-mergeado que rompe
+# produccion de madrugada, sin nadie mirando, cuesta mucho mas. Si David
+# decide que los security-major SI deben entrar solos, invertir es UNA linea:
+# cambiar la condicion de `gate` de abajo para volver a incluir `$GHSA_ID`.
+#
+# Alcance: SOLO PRs de `dependabot[bot]`. Bots que no son Dependabot
+# (ej. propagadores internos, workflows de sincronizacion) no tienen
+# `update-type` semver y no los cubre este workflow — ver el caller de cada
+# repo para saber si tienen su propio mecanismo.
+#
+# El caller debe disparar en `pull_request_target`, NUNCA en `pull_request`:
+# Dependabot corre `pull_request` con un GITHUB_TOKEN de solo lectura, y
+# habilitar auto-merge necesita escritura. `pull_request_target` corre con el
+# contexto del repo base — por eso este job NUNCA hace checkout del codigo del
+# PR (no hay ningun paso `actions/checkout` aqui, a proposito).
+
+on:
+  workflow_call:
+    inputs:
+      merge_method:
+        description: >-
+          Metodo para `gh pr merge --auto`: merge, squash o rebase. Debe
+          coincidir con lo que el repo caller tiene habilitado
+          (Settings > General > Pull Requests) o el comando falla.
+        required: false
+        type: string
+        default: "merge"
+
+jobs:
+  automerge:
+    # Gate mas importante del archivo: pull_request_target dispara para
+    # CUALQUIER PR (tambien los de personas). Sin este `if`, el job entero
+    # correria contra PRs humanos. Para un dev, "sin auto-merge" es
+    # informacion ("todavia no"), no un hueco — nunca tocarlos.
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+
+    steps:
+      - name: Metadata de Dependabot
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+          # alert-lookup habilita el output `ghsa-id`: sin esto no hay forma
+          # de distinguir "bump major porque si" de "bump major porque el fix
+          # de seguridad solo existe en esa version" — y el criterio de David
+          # exige tratarlos distinto.
+          alert-lookup: true
+
+      - name: Decidir elegibilidad
+        id: gate
+        env:
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          GHSA_ID: ${{ steps.metadata.outputs.ghsa-id }}
+        run: |
+          # `major` manda siempre — ver nota de desempate pendiente arriba.
+          # $GHSA_ID queda calculado (no se usa en la condicion todavia) para
+          # que invertir el desempate, si David lo pide, sea agregar
+          # `|| [ -n "${GHSA_ID}" ]` a la condicion, no reescribir el paso.
+          if [ "${UPDATE_TYPE}" != "version-update:semver-major" ]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Elegible para auto-merge (update-type=${UPDATE_TYPE})."
+          else
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::NO elegible — major (update-type=${UPDATE_TYPE}, ghsa-id=${GHSA_ID:-ninguno}). Se deja para revision humana, incluso si es un fix de seguridad — desempate pendiente de confirmacion de David."
+          fi
+
+      - name: Habilitar auto-merge
+        if: steps.gate.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # En repos CON Merge Queue esto equivale a "Merge when ready" y
+          # encola; el merge directo devuelve HTTP 405 y eso es lo esperado.
+          gh pr merge --auto --${{ inputs.merge_method }} "$PR_URL"
