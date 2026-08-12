@@ -82,13 +82,14 @@ jobs:
       - name: Metadata de Dependabot
         id: metadata
         # Pin a SHA, siempre (estandar de la casa) -- v2 es un tag movil.
-        # Aca importa mas que en la mayoria: el gate hoy es fail-closed (nunca
-        # auto-mergea un major porque `update-type` a veces viene vacio, ver
-        # nota mas abajo), pero una v2.x futura que arreglara ese parseo
-        # encenderia el auto-merge de majors SOLO, en todos los callers de
-        # este reusable a la vez, sin un PR ni un review de por medio. Pinear
-        # restringe -- no amplia nada; un bump de version sigue siendo tan
-        # facil como cambiar este SHA a proposito.
+        # Aca importa mas que en la mayoria: el gate SI auto-mergea hoy
+        # (patch/minor de un solo paquete, rutinariamente) -- lo que nunca
+        # hace es dejar pasar un major, por el fail-closed de `update-type`
+        # vacio (ver nota mas abajo). Una v2.x futura que arreglara ese
+        # parseo encenderia el auto-merge de majors SOLO, en todos los
+        # callers de este reusable a la vez, sin un PR ni un review de por
+        # medio. Pinear restringe -- no amplia nada; un bump de version
+        # sigue siendo tan facil como cambiar este SHA a proposito.
         uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a  # v2.5.0
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
