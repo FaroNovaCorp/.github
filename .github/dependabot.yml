@@ -1,0 +1,46 @@
+# Dependabot — SOLO agrupacion de security updates. NO se toca ninguna cadencia.
+#
+# Por que existe este archivo (F1 del plan `optimizacion-github-actions`,
+# extendido en F2 de TSK-20260813T212511-olre a este repo, que quedo fuera
+# del rollout original):
+# hasta hoy este repo no tenia `.github/dependabot.yml`. Sin ese archivo
+# Dependabot no hace version updates en absoluto, asi que cualquier PR de
+# Dependabot que exista hoy es TODO security update. Consecuencia: la palanca
+# "bajar la cadencia" no existe y NO debe buscarse — retrasaria parches de
+# vulnerabilidades conocidas. La unica palanca autorizada aqui es AGRUPAR
+# (guardarrail 1.3 del plan original: ninguna configuracion de esta fase
+# puede retrasar, silenciar ni limitar un security update).
+#
+# Como agrupa sin encender nada nuevo — el riesgo de esta fase es justamente
+# prender version updates sin querer al crear un archivo que no existia:
+#
+#   - `open-pull-requests-limit: 0` apaga los version updates de esta entrada.
+#     Doc: "You can temporarily disable version updates for a package manager
+#     by setting this option to zero." Y: "Security update pull requests are
+#     not subject to this limit and do not count toward it."
+#   - `groups` aplica por defecto SOLO a version updates ("When undefined,
+#     defaults to version updates"), por eso `applies-to: security-updates` va
+#     explicito.
+#   - `schedule` queda inerte: sin version updates no hay nada que agendar.
+#     Es obligatorio en el esquema, no es una cadencia real.
+#
+# Efecto inmediato ESPERADO al aterrizar, no es un fallo: "When grouped
+# security updates are first enabled, Dependabot will immediately try to create
+# grouped pull requests. You may notice Dependabot closing old pull requests
+# and opening new ones." Habra un pico puntual de CI.
+#
+# Validacion: el siguiente lote de advisories llega IGUAL DE RAPIDO, pero en
+# menos PRs. Agrupar no puede significar tardar mas en enterarnos.
+#
+# Rollback: borrar este archivo (un PR) — vuelve al comportamiento actual.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      security-github-actions:
+        applies-to: security-updates
+        patterns: ["*"]
