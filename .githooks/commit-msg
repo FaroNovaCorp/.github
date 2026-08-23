@@ -1,0 +1,164 @@
+#!/bin/sh
+# faronova-team-hook v2
+#
+# ^ Esa linea es el MARKER del equipo, y es contrato: `install-git-hooks.sh` y
+# `bootstrap-dev.sh` la usan para reconocer un hook gestionado por nosotros y
+# distinguirlo de un hook personal del dev. No la borres ni la reformatees.
+# Ver TSK-20260727T213504-luxf.
+#
+# commit-msg hook — Inyecta trailer `Claude-Session: <uuid>` al commit message
+# cuando hay una sesion de Claude Code activa para este worktree.
+#
+# Source of truth: recursos-compartidos/hooks/git/commit-msg
+# Activacion: `core.hooksPath` apuntando a este directorio, configurado una vez
+# por maquina y repo con recursos-compartidos/scripts/install-git-hooks.sh. El
+# nombre del archivo ES el nombre del hook porque git ejecuta
+# `$hooksPath/commit-msg` — de ahi que ya no se llame `*-session-trailer.sh`.
+#
+# Diseno:
+# - Lee el breadcrumb escrito por ~/.claude/hooks/session-breadcrumb-write.sh
+#   (PreToolUse que dispara antes de cada `git commit`/`git push`/`gh pr create`).
+# - Indexado por SHA1 del worktree toplevel — un breadcrumb por worktree,
+#   sin race condition con sesiones paralelas.
+# - TTL 24h: si el breadcrumb es mas viejo, se ignora (sesion probablemente muerta).
+# - NO depende de `Co-Authored-By.*Claude` — cubre commits manuales del dev
+#   hechos con Claude Code activo (otra ventana/terminal dentro del mismo worktree).
+# - Falla silenciosa: si algo no cuadra, no bloquea ni modifica el commit.
+#
+# Argumento del hook:
+#   $1 — path al archivo del commit message.
+#
+# PORTABILIDAD: la inyeccion usa `awk` + `mv` (POSIX), no `sed -i`. No hay
+# deteccion de plataforma ni bifurcacion: el mismo codigo corre igual en Linux/WSL
+# y en macOS. La version anterior usaba `sed -i ''` (BSD-only) y no inyectaba nada
+# en Linux — TSK-20260724T130500-2laj.
+
+COMMIT_MSG_FILE="$1"
+
+[ -r "$COMMIT_MSG_FILE" ] || exit 0
+
+# No duplicar si ya tiene el trailer
+grep -q "^Claude-Session:" "$COMMIT_MSG_FILE" 2>/dev/null && exit 0
+
+# Salida temprana si el repo no es de FaroNova. Mismo criterio que
+# prepare-commit-msg, install-git-hooks.sh y propagar.sh: por el
+# remote, no por el nombre de la carpeta.
+#
+# Antes este hook no filtraba por repo, asi que un repo de otra organizacion con los
+# hooks instalados recibia `Claude-Session: <uuid>` — un identificador interno de
+# sesion en el historial de un tercero. Detectado al verificar el criterio "repo
+# no-FaroNova no recibe trailers", que solo se cumplia en el otro hook.
+#
+# LAS DOS ORGS: ver la nota extensa en prepare-commit-msg. Ambos hooks tenian el
+# mismo patron solo-Devs y ambos dejaron de inyectar en los repos ya migrados a
+# FaroNovaCorp (TSK-20260810T035602-uefx).
+git config --get remote.origin.url 2>/dev/null | grep -qE '[:/](FaroNovaDevs|FaroNovaCorp)/' || exit 0
+
+# Calcular worktree toplevel y hash — mismo algoritmo que el writer.
+WORKTREE=$(git rev-parse --show-toplevel 2>/dev/null)
+[ -z "$WORKTREE" ] && exit 0
+
+if command -v sha1sum >/dev/null 2>&1; then
+  KEY=$(printf '%s' "$WORKTREE" | sha1sum | cut -c1-16)
+elif command -v shasum >/dev/null 2>&1; then
+  KEY=$(printf '%s' "$WORKTREE" | shasum -a 1 | cut -c1-16)
+else
+  exit 0
+fi
+
+BREADCRUMB_FILE="${HOME}/.claude/session-breadcrumbs/${KEY}.json"
+[ -r "$BREADCRUMB_FILE" ] || exit 0
+
+# TTL 24h. Tres intentos de escribir esto, y los dos primeros fallaron por la MISMA
+# razon de fondo — cada utilidad de fecha/tiempo difiere entre GNU y BSD:
+#
+#   1. `stat -f %m || stat -c %Y`  (el original, BSD-primero)
+#      ABORTABA EL COMMIT en Linux. GNU `stat -f` no acepta el formato como
+#      posicional: trata `%m` como nombre de archivo, falla, y escribe el bloque de
+#      estado del FILESYSTEM a STDOUT. El `||` cae al fallback, pero la sustitucion
+#      de comandos captura el stdout de TODA la lista, asi que MTIME queda con seis
+#      lineas de basura. Y `/bin/sh` es dash, donde un error de expansion aritmetica
+#      es FATAL: `Illegal number`, exit 2. `commit-msg` es un hook bloqueante, asi
+#      que exit != 0 ABORTA EL COMMIT. No explotaba solo porque el `[ -r ... ]` de
+#      arriba salia antes (no habia breadcrumb): un bug tapaba al otro.
+#
+#   2. `date -u -d <iso>` / `date -j -f`  (descartado en revision, sin llegar a CI)
+#      `-d` es GNU-only y `-j` BSD-only. En macOS `-d` significa ademas "set kernel
+#      DST value", o sea una opcion con semantica completamente distinta.
+#
+#   3. `find "$f" -mtime -1`  (fallo en el CI de macOS)
+#      Parecia POSIX e identico en ambos, y NO lo es: GNU `find` IGNORA la parte
+#      fraccional al contar periodos de 24h, asi que un archivo recien escrito da 0
+#      periodos y `-mtime -1` es verdadero. BSD `find` REDONDEA HACIA ARRIBA al
+#      siguiente periodo completo, asi que ese mismo archivo da 1 periodo y
+#      `-mtime -1` es FALSO -> en macOS todo breadcrumb se consideraba vencido y el
+#      trailer `Claude-Session:` no se inyectaba nunca.
+#
+# Lo que si funciona en las dos: `stat` GNU-PRIMERO, con ASIGNACIONES SEPARADAS, mas
+# validacion numerica antes de tocar la aritmetica. Las asignaciones separadas son la
+# pieza clave — es lo que evita que el stdout de la variante que falla se concatene
+# con el de la que funciona (el bug del intento 1). Y GNU-primero es seguro en ambas
+# direcciones: BSD `stat -c` es un error de uso que no escribe nada a stdout.
+#
+# Mismo patron que documenta tests/session-touched-files-track.bats:511.
+# TSK-20260724T130500-2laj.
+MTIME=$(stat -c %Y "$BREADCRUMB_FILE" 2>/dev/null) \
+    || MTIME=$(stat -f %m "$BREADCRUMB_FILE" 2>/dev/null)
+
+# Blindaje: en un hook fail-silent NINGUNA ruta puede devolver != 0, y una expansion
+# aritmetica sobre un valor no numerico es fatal en dash. Si el mtime no es un entero
+# limpio, se trata el breadcrumb como no utilizable y se sale bien.
+case "$MTIME" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+
+NOW=$(date +%s)
+case "$NOW" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+
+[ "$((NOW - MTIME))" -gt 86400 ] && exit 0
+
+# Extraer session_id. jq si disponible; fallback a grep+sed para no fallar
+# si jq no esta instalado en el entorno del hook.
+if command -v jq >/dev/null 2>&1; then
+  SESSION_ID=$(jq -r '.session_id // empty' "$BREADCRUMB_FILE" 2>/dev/null)
+else
+  SESSION_ID=$(grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$BREADCRUMB_FILE" 2>/dev/null \
+    | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+fi
+
+# Validar formato UUID v4
+echo "$SESSION_ID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || exit 0
+
+# Inyectar el trailer con UN solo awk — mismo patron que
+# prepare-commit-msg (el hook hermano), donde esta la explicacion completa de por que
+# awk y no `sed -i ''` (BSD-only, fallaba silenciosamente en Linux) y por que un
+# solo awk en vez de `if grep ... else printf`.
+#
+# La clausula del END es lo que mantiene los DOS trailers en el mismo parrafo: este
+# hook corre DESPUES de prepare-commit-msg, asi que la ultima linea suele ser
+# `Task: TSK-...`. Sin la clausula se insertaba una linea en blanco entre los dos,
+# git parseaba solo el ultimo parrafo y `Task:` desaparecia del bloque de trailers
+# — o sea se rompia justamente la trazabilidad commit->tarea que estos hooks
+# existen para dar.
+#
+# `-v` es seguro porque SESSION_ID ya paso la validacion de formato UUID de arriba,
+# que excluye `\`. No relajar esa regex sin revisar esto.
+TMP=$(mktemp "$(dirname "$COMMIT_MSG_FILE")/.commit-msg.XXXXXX") || exit 0
+trap 'rm -f "$TMP"' EXIT
+
+cp -p "$COMMIT_MSG_FILE" "$TMP" 2>/dev/null || :
+
+if LC_ALL=C awk -v t="Claude-Session: ${SESSION_ID}" '
+    /^Co-Authored-By/ && !done { print t; done=1 }
+    { print; last=$0 }
+    END { if (!done) {
+            if (NR>0 && last!="" && \
+                last !~ /^(Task|Claude-Session|Co-Authored-By|Signed-off-by):[ \t]/) print ""
+            print t } }
+  ' "$COMMIT_MSG_FILE" > "$TMP"; then
+  mv -f "$TMP" "$COMMIT_MSG_FILE" 2>/dev/null || :
+fi
+
+exit 0
