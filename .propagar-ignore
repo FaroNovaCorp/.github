@@ -1,0 +1,10 @@
+# Archivos que propagar.sh NO debe propagar a este repo (uno por linea, basename).
+
+# blast-radius: solo aplica a los 5 repos con rol CertaintyPipelineDeploy.
+# .github (repo especial de la org, perfil + workflows reusables) no tiene ese rol.
+blast-radius.md
+
+# secret-scan-canonico: .github es el repo que DEFINE el reusable secret-scan.yml;
+# su propio caller (secret-scan-self.yml) lo invoca por ruta local, no via un
+# caller pineado a SHA como los 6 repos consumidores listados en el snippet.
+secret-scan-canonico.md

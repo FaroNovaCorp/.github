@@ -1,0 +1,228 @@
+#!/bin/sh
+# faronova-team-hook v2
+#
+# ^ Esa linea es el MARKER del equipo, y es contrato: `install-git-hooks.sh` y
+# `bootstrap-dev.sh` la usan para reconocer un hook gestionado por nosotros y
+# distinguirlo de un hook personal del dev. No la borres ni la reformatees.
+# Antes esa deteccion era una heuristica de contenido (buscaba el nombre viejo
+# del archivo, o las cadenas `Claude-Session` / `TSK-...`) que rompia con
+# cualquier barrido de comentarios. Ver TSK-20260727T213504-luxf.
+#
+# prepare-commit-msg hook — inyecta el trailer `Task: TSK-...` al mensaje del
+# commit cuando hay una tarea activa en coordination_tasks para el branch y
+# developer actuales.
+#
+# Diseno:
+# - Puramente funcion de (branch, developer, DB). Sin env vars ni cache files
+#   mutables. Esto evita bugs como el del trailer Claude-Session que se cacheaba
+#   en ~/.claude/debug/latest — si el estado no es local al commit, es stale.
+# - Solo injecta si hay EXACTAMENTE 1 tarea activa para este developer+branch.
+#   Si hay 0 o multiples, no toca el commit (para branches compartidos como
+#   main donde siempre hay varias tareas activas concurrentes).
+# - Respeta commits que ya tienen `Task: TSK-...` (no duplica).
+# - Inserta antes de `Co-Authored-By:` si existe, sino al final del mensaje.
+# - Falla silenciosamente si la Lambda/DB no responde — es una mejora del commit,
+#   no un gate.
+#
+# Source of truth: recursos-compartidos/hooks/git/prepare-commit-msg
+# Activacion: `core.hooksPath` apuntando a este directorio, configurado una vez
+# por maquina y repo con recursos-compartidos/scripts/install-git-hooks.sh. El
+# nombre del archivo ES el nombre del hook porque git ejecuta
+# `$hooksPath/prepare-commit-msg` — de ahi que ya no se llame `*-task-trailer.sh`.
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="${2:-}"
+
+# No tocar commits de merge, squash, cherry-pick template, rebase
+case "$COMMIT_SOURCE" in
+    merge|squash|commit) exit 0 ;;
+esac
+
+# Archivo no existe o no se puede leer
+[ -r "$COMMIT_MSG_FILE" ] || exit 0
+
+# Ya tiene trailer — no duplicar
+if grep -qE '^Task: TSK-' "$COMMIT_MSG_FILE" 2>/dev/null; then
+    exit 0
+fi
+
+# Limpieza unica para TODOS los temporales del hook. En `sh` un segundo `trap` para
+# la misma señal REEMPLAZA al primero, asi que hay un solo trap y un solo cleanup.
+TMP=""
+OUT=""
+cleanup() {
+    [ -n "$TMP" ] && rm -f "$TMP"
+    [ -n "$OUT" ] && rm -f "$OUT"
+    return 0
+}
+trap cleanup EXIT
+
+# Diagnostico opcional. Este hook es fail-silent por diseño, lo que hace que
+# "no aparecio el trailer" sea indistinguible entre siete causas distintas. Con
+# TASK_TRAILER_DEBUG=1 cada salida temprana dice por que.
+debug() {
+    [ -n "${TASK_TRAILER_DEBUG:-}" ] && echo "task-trailer: $1" >&2
+    return 0
+}
+
+BRANCH=$(git branch --show-current 2>/dev/null)
+[ -z "$BRANCH" ] && { debug "sin branch (detached HEAD?)"; exit 0; }
+
+# Salida temprana si el repo no es de FaroNova. Mismo criterio que
+# scripts/install-git-hooks.sh y scripts/propagar.sh: se identifica por el remote,
+# no por el nombre de la carpeta.
+#
+# No es un whitelist de personas (eso es justo lo que este cambio elimina): es un
+# filtro de repo. Y hace falta porque al quitar el `case` de emails desaparecio la
+# salida temprana que evitaba pagar un round trip a la Lambda en cada commit de
+# cualquier identidad no registrada — un bot de CI, un contribuidor externo, o un
+# dev con el `user.email` mal configurado.
+#
+# LAS DOS ORGS. El patron acepta `FaroNovaDevs` y `FaroNovaCorp` porque tras el
+# traspaso a Corp conviven ambas: los checkouts nuevos apuntan a Corp y algunos
+# viejos siguen en Devs. Este hook decia SOLO `FaroNovaDevs` mientras el resto de
+# los guards ya aceptaba las dos (PR #373), asi que en los repos ya migrados salia
+# por aca y NO inyectaba trailer — fallando ABIERTO y en silencio, porque estos
+# hooks son fail-silent por diseño. La suite lo tapaba: sus 44 tests corrian con un
+# fixture fijado a Devs, la org que ya casi nadie usa (TSK-20260810T035602-uefx).
+git config --get remote.origin.url 2>/dev/null | grep -qE '[:/](FaroNovaDevs|FaroNovaCorp)/' \
+    || { debug "repo no-FaroNova, sin trailer"; exit 0; }
+
+# Identidad del developer: se resuelve contra coordination_developers, NO contra un
+# whitelist en codigo.
+#
+# Antes habia un `case` con cinco emails hardcodeados. Eso mantenia una segunda
+# fuente de verdad en paralelo a coordination_developers y se desincronizaba en cada
+# alta: el primer developer de Linux del equipo (nf.celis@faronova.co) no matcheaba
+# ningun patron, caia en `*)` y salia sin inyectar nada. Agregar su email lo arreglaba
+# ese dia y lo volvia a romper con el siguiente developer.
+#
+# El match va EXACTO y case-insensitive, igual que el resolvedor canonico
+# (.claude/scripts/coordination_lib.py:175,252). El `case` con globs permitia que
+# cualquier direccion que CONTUVIERA "david" o "raul" se atribuyera a esa persona —
+# vector de impersonacion ya identificado y cerrado en el lado Python (PR #61).
+#
+# CONTRATO: emails ASCII, y `email_patterns` en minusculas y sin espacios. `tr` y
+# `ascii_downcase` no bajan Unicode (Python si), asi que esto NO es equivalente a
+# `.lower()` de Python para acentos. Se valida al dar de alta un developer.
+DEV_EMAIL=$(git config user.email 2>/dev/null | LC_ALL=C tr '[:upper:]' '[:lower:]')
+[ -z "$DEV_EMAIL" ] && { debug "sin user.email"; exit 0; }
+
+# UNA sola query, con las unicas formas que tienen precedente probado en la accion
+# `query` de la Lambda: un JOIN entre tablas coordination_*. Sin `unnest` (el guard
+# de tokens de la Lambda lo rechaza: `Access denied to tables: unnest`), sin
+# `= ANY(...)` y sin funciones SQL. El email se compara mas abajo, en el cliente,
+# que es exactamente lo que hace coordination_lib.py.
+#
+# LIMIT 5 y no 2: el filtro por email se aplica DESPUES de la query, asi que el
+# limite no puede ser 2 sin arriesgar descartar la fila que si matchea.
+#
+# El escapado de `'` cubre el literal SQL; el JSON lo construye `jq` mas abajo. Son
+# dos capas distintas: duplicar la comilla simple no protege del `"` que un nombre de
+# rama valido de git SI admite.
+BRANCH_SQL=$(printf '%s' "$BRANCH" | sed "s/'/''/g")
+SQL="SELECT t.task_id, d.email_patterns FROM coordination_tasks t JOIN coordination_developers d ON d.slug = t.assignee WHERE d.active = true AND t.branch = '${BRANCH_SQL}' AND t.status = 'en_progreso' LIMIT 5"
+
+# Payload con `jq`, no con `printf`. Interpolar el SQL en el JSON a mano permitia
+# inyectar claves: una rama llamada `fix/x","action":"insert_task","sql":"SELECT/**/1`
+# producia un payload con DOS claves `action`, y el parser se queda con la ultima —
+# accion arbitraria de escritura sobre la DB de coordinacion con las credenciales del
+# dev. `jq --arg` escapa el valor y deja una sola `action`.
+#
+# `tr -d '\n'` y no `base64 -w0`: `-w` es GNU-only y romperia macOS. GNU base64
+# envuelve a 76 columnas por defecto y BSD no.
+PAYLOAD=$(jq -nc --arg sql "$SQL" '{action:"query",sql:$sql}' 2>/dev/null | base64 | tr -d '\n')
+[ -z "$PAYLOAD" ] && { debug "no se pudo construir el payload"; exit 0; }
+
+# Outfile con mktemp. Antes era el path fijo /tmp/task-trailer-result.json,
+# compartido por todos los commits de la maquina: dos commits concurrentes en
+# worktrees distintos se pisaban el resultado.
+OUT=$(mktemp) || { debug "mktemp fallo"; exit 0; }
+
+# Fail-silent con timeout corto: esto es una mejora del commit, no un gate.
+if ! aws lambda invoke \
+    --function-name tablero-equipo-coordination-prod \
+    --payload "$PAYLOAD" \
+    --region us-east-1 \
+    --cli-read-timeout 3 \
+    --cli-connect-timeout 2 \
+    "$OUT" >/dev/null 2>&1; then
+    debug "lambda invoke fallo o timeout"
+    exit 0
+fi
+
+# Filtrar por email en el cliente y quedarse con los task_id que corresponden a este
+# developer. `ascii_downcase` en los patterns por el contrato ASCII de arriba.
+TASK_IDS=$(jq -r '.body' "$OUT" 2>/dev/null \
+    | jq -r --arg e "$DEV_EMAIL" \
+        '.rows[]? | select([.email_patterns[]? | ascii_downcase] | index($e)) | .task_id' \
+        2>/dev/null)
+
+[ -z "$TASK_IDS" ] && { debug "sin tarea activa para $DEV_EMAIL en $BRANCH"; exit 0; }
+
+# Solo inyectar si hay EXACTAMENTE 1. Con 0 o varias no se toca el commit: en
+# branches compartidos como main suele haber varias tareas activas a la vez.
+COUNT=$(printf '%s\n' "$TASK_IDS" | grep -c .)
+[ "$COUNT" -eq 1 ] || { debug "$COUNT tareas activas en $BRANCH, no se inyecta"; exit 0; }
+
+TASK_ID=$(printf '%s\n' "$TASK_IDS" | head -1)
+
+# Validar formato TSK-YYYYMMDDTHHMMSS-xxxx
+echo "$TASK_ID" | grep -qE '^TSK-[0-9]{8}T[0-9]{6}-[a-z0-9]{4}$' || exit 0
+
+# Insertar el trailer con UN solo awk. Reemplaza el par `grep`+`sed -i ''` anterior.
+#
+# Por que awk y no sed:
+# - `sed -i ''` es sintaxis BSD. GNU sed lo lee como "script vacio" y toma el
+#   siguiente argumento como archivo de entrada: falla y NO modifica el mensaje.
+#   El hook igual salia 0, asi que el trailer desaparecia en silencio en Linux.
+# - awk (-v, ERE, print) es POSIX: mismo comportamiento en gawk y en el BWK awk
+#   de macOS. Sin deteccion de plataforma, sin bifurcacion.
+#
+# Por que un solo awk y no `if grep ... else printf`:
+# - El `grep -q "Co-Authored-By"` de antes NO estaba anclado, asi que un mensaje
+#   que solo MENCIONA "Co-Authored-By" en el cuerpo entraba a la rama del sed,
+#   donde `/^Co-Authored-By/` no matcheaba nada -> el trailer no se insertaba y
+#   la rama del `printf` ya no se alcanzaba. Se perdia en silencio, en las DOS
+#   plataformas.
+# - El `sed` sin `g` sustituia en CADA linea que empezara por Co-Authored-By, asi
+#   que un commit con dos co-authors recibia DOS trailers `Task:`. La guarda
+#   `!done` lo arregla — tambien en macOS, donde ese bug esta vivo hoy.
+#
+# La lista de claves del END es ENUMERADA a proposito. Un patron generico
+# (`^[A-Za-z][A-Za-z0-9-]*:`) trata el asunto del commit (`feat: algo`) y la prosa
+# (`Nota: revisar`) como trailers, suprime la linea en blanco y funde el trailer
+# con el parrafo anterior. Git descarta un parrafo final mixto completo, asi que
+# `git interpret-trailers --parse` devuelve CERO trailers. Si se agrega un trailer
+# nuevo al sistema, hay que agregarlo a esta lista.
+#
+# `-v` procesa escapes de barra invertida en gawk y en BWK awk. Es seguro aqui
+# SOLO porque TASK_ID ya paso la validacion de formato de arriba
+# (^TSK-[0-9]{8}T[0-9]{6}-[a-z0-9]{4}$), que excluye `\`. No relajar esa regex sin
+# revisar esto.
+# El temporal va junto al archivo de mensaje (mismo directorio => mismo filesystem),
+# para que el `mv` de abajo sea un rename atomico y no un copy+unlink. Con el $TMPDIR
+# por defecto de macOS (/var/folders/...) seria otro filesystem y se perderia esa
+# garantia. Template explicito porque `mktemp` sin template no es asumible en BSD.
+# El trap ya esta instalado arriba (cleanup unico) — no instalar otro aca.
+TMP=$(mktemp "$(dirname "$COMMIT_MSG_FILE")/.commit-msg.XXXXXX") || exit 0
+
+# `cp -p` best-effort: le pasa el modo del original al temporal (mktemp crea 0600).
+# NO condicionamos el flujo a su exito — `cp -p` falla al preservar dueño en repos
+# compartidos, y perder un modo de archivo es mucho mas barato que perder el trailer.
+cp -p "$COMMIT_MSG_FILE" "$TMP" 2>/dev/null || :
+
+if LC_ALL=C awk -v t="Task: ${TASK_ID}" '
+    /^Co-Authored-By/ && !done { print t; done=1 }
+    { print; last=$0 }
+    END { if (!done) {
+            if (NR>0 && last!="" && \
+                last !~ /^(Task|Claude-Session|Co-Authored-By|Signed-off-by):[ \t]/) print ""
+            print t } }
+  ' "$COMMIT_MSG_FILE" > "$TMP"; then
+    # mv en el mismo directorio => rename atomico en Linux y macOS. Si algo falla
+    # antes de esta linea, el mensaje original queda intacto.
+    mv -f "$TMP" "$COMMIT_MSG_FILE" 2>/dev/null || :
+fi
+
+exit 0
