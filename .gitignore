@@ -6,3 +6,7 @@
 
 # Sistema
 .DS_Store
+
+# Bytecode de Python (nunca se commitea)
+__pycache__/
+*.pyc
