@@ -148,6 +148,46 @@ EOF
   [[ "$output" != *"::error"* ]]
 }
 
+@test "gh pr merge --auto falla con checks en rojo: exit 1 visible, no se traga en silencio (hallazgo confirmado 3/3, ronda 2)" {
+  write_gh_mock '
+    case "$1 $2" in
+      "pr checks") exit 1 ;;
+      "pr merge") exit 42 ;;
+    esac
+  '
+  run_step
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::gh pr merge --auto fallo"* ]]
+}
+
+@test "gh pr merge --auto falla con checks en verde: exit 1 visible, sin entrar a la vigilancia (hallazgo confirmado 3/3, ronda 2)" {
+  write_gh_mock '
+    case "$1 $2" in
+      "pr checks") exit 0 ;;
+      "pr merge") exit 42 ;;
+    esac
+  '
+  run_step
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::gh pr merge --auto fallo"* ]]
+  ! grep -q "api graphql" "$BATS_TEST_TMPDIR/gh.log"
+}
+
+@test "gh api graphql falla durante TODA la ventana: 'no pude observar', no confunde con el bug confirmado (hallazgo MEDIO/ALTO, ronda 2)" {
+  write_gh_mock '
+    case "$1 $2" in
+      "pr checks") exit 0 ;;
+      "pr merge") exit 0 ;;
+      "api graphql") echo "persistent failure" >&2; exit 1 ;;
+    esac
+  '
+  run_step
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error title=No pude observar el estado del PR"* ]]
+  [[ "$output" != *"::error title=Auto-merge armado sin completar"* ]]
+  grep -q "Vigilancia sin observacion" "$GITHUB_STEP_SUMMARY"
+}
+
 @test "GRACE_SECONDS invalido: falla ruidoso, no silencioso (hallazgo BAJO)" {
   export GRACE_SECONDS="no-numerico"
   write_gh_mock '

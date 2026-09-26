@@ -252,11 +252,21 @@ jobs:
 
           if [ "${CHECKS_EXIT}" -ne 0 ]; then
             echo "::notice::Checks requeridos no resolvieron en verde dentro de ${WAIT_MINUTES}min (exit=${CHECKS_EXIT}). Habilito auto-merge igual -- sin cambios de comportamiento: espera a que resuelvan solos o a una persona."
-            gh pr merge --auto --"${MERGE_METHOD}" "$PR_URL"
+            if ! gh pr merge --auto --"${MERGE_METHOD}" "$PR_URL"; then
+              echo "::error::gh pr merge --auto fallo -- auto-merge NO quedo habilitado (permisos, metodo invalido, o error de API). Hallazgo confirmado 3/3 en /revisar-pr #19: bajo 'set +e', un fallo aca antes se tragaba en silencio."
+              exit 1
+            fi
             exit 0
           fi
 
-          gh pr merge --auto --"${MERGE_METHOD}" "$PR_URL"
+          # `if ! gh ...; then exit 1; fi`, no una llamada suelta: bajo
+          # `set +e` una llamada suelta no verificada se traga cualquier
+          # fallo en silencio -- confirmado 3/3 en /revisar-pr #19 (los tres
+          # revisores lo reprodujeron con exit codes reales del `gh` real).
+          if ! gh pr merge --auto --"${MERGE_METHOD}" "$PR_URL"; then
+            echo "::error::gh pr merge --auto fallo -- auto-merge NO quedo habilitado (permisos, metodo invalido, o error de API). No tiene sentido vigilar algo que nunca se armo."
+            exit 1
+          fi
 
           # Ventana corta de vigilancia -- sin forzar nada (ver nota arriba).
           # `state` sola no alcanza: un PR ya admitido a la cola sigue en
@@ -265,6 +275,13 @@ jobs:
           # ahi seria un falso positivo (hallazgo ALTO de /revisar-pr #19).
           # `isInMergeQueue` (GraphQL) distingue "progresando en la cola" de
           # "nunca entro".
+          # OBSERVED_OK distingue "confirme que sigue sin cola" de "nunca
+          # pude ver el estado" (hallazgo MEDIO/ALTO de /revisar-pr #19,
+          # ronda 2: una caida persistente de `gh api graphql`/`jq` durante
+          # TODA la ventana no debe diagnosticarse como el bug D-1275/D-1287
+          # -- es una falla de observacion distinta).
+          OBSERVED_OK=false
+          IN_QUEUE=false
           GRACE_DEADLINE=$(( $(date +%s) + GRACE_SECONDS ))
           while [ "$(date +%s)" -lt "${GRACE_DEADLINE}" ]; do
             READ_ERR="$(mktemp)"
@@ -280,7 +297,15 @@ jobs:
             fi
             rm -f "$READ_ERR"
             STATE=$(echo "${PR_JSON}" | jq -r '.data.resource.state // "UNKNOWN"')
+            JQ_STATE_EXIT=$?
             IN_QUEUE=$(echo "${PR_JSON}" | jq -r '.data.resource.isInMergeQueue // false')
+            JQ_QUEUE_EXIT=$?
+            if [ "${JQ_STATE_EXIT}" -ne 0 ] || [ "${JQ_QUEUE_EXIT}" -ne 0 ]; then
+              echo "::warning::respuesta de gh api graphql no es el JSON esperado -- jq fallo (state_exit=${JQ_STATE_EXIT}, queue_exit=${JQ_QUEUE_EXIT})."
+              sleep "${GRACE_POLL_SECONDS}"
+              continue
+            fi
+            OBSERVED_OK=true
             if [ "${STATE}" = "MERGED" ]; then
               echo "::notice::Mergeado (via auto-merge/cola) dentro de la ventana de gracia."
               exit 0
@@ -291,9 +316,18 @@ jobs:
             sleep "${GRACE_POLL_SECONDS}"
           done
 
-          if [ "${IN_QUEUE:-false}" = "true" ]; then
+          if [ "${IN_QUEUE}" = "true" ]; then
             echo "::notice::Sigue en Merge Queue al cierre de la ventana de gracia (${GRACE_SECONDS}s) -- progresando, no es el bug. No alerto."
             exit 0
+          fi
+
+          if [ "${OBSERVED_OK}" != "true" ]; then
+            echo "::error title=No pude observar el estado del PR::gh api graphql fallo durante toda la ventana de gracia (${GRACE_SECONDS}s) -- no hay evidencia para diagnosticar D-1275/D-1287 ni para descartarlo. Revisar manualmente: ${PR_URL}"
+            {
+              echo "## Vigilancia sin observacion -- no es un diagnostico de D-1275/D-1287"
+              echo "gh api graphql fallo en cada intento durante ${GRACE_SECONDS}s. Revisar manualmente: \`gh pr view ${PR_URL}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
           echo "::error title=Auto-merge armado sin completar (D-1275/D-1287)::Checks requeridos en verde, auto-merge habilitado hace >${GRACE_SECONDS}s, PR sin mergear ni encolar -- GITHUB_TOKEN no puede encolar en Merge Queue (causa confirmada, ver comentario del step). Lo resuelve /merge-watchdog (Paso 2ter, identidad humana) en su proxima pasada, o gh pr merge --${MERGE_METHOD} manual: ${PR_URL}"
