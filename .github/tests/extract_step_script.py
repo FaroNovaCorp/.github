@@ -7,6 +7,7 @@ Existe para que dependabot-automerge.bats corra el script REAL que GitHub
 Actions ejecuta -- nunca una copia mantenida a mano que puede quedar
 desincronizada del YAML.
 """
+
 import sys
 
 import yaml
@@ -14,7 +15,10 @@ import yaml
 
 def main() -> int:
     if len(sys.argv) != 4:
-        print(f"uso: {sys.argv[0]} <workflow.yml> <job_id> <nombre del step>", file=sys.stderr)
+        print(
+            f"uso: {sys.argv[0]} <workflow.yml> <job_id> <nombre del step>",
+            file=sys.stderr,
+        )
         return 2
 
     workflow_path, job_id, step_name = sys.argv[1], sys.argv[2], sys.argv[3]

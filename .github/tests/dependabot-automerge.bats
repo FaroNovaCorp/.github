@@ -6,9 +6,21 @@
 # extract_step_script.py, nunca una copia mantenida a mano -- con `gh` y
 # `timeout` mockeados. Sin red, sin PR real, sin runner de Actions.
 #
-# `timeout` se mockea tambien: macOS no trae `timeout` de coreutils (el
-# runner `ubuntu-latest` real si). El mock ignora la duracion y ejecuta el
-# comando tal cual, para que la prueba corra igual en ambos SO.
+# `bash -eo pipefail`, siempre: es el shell default de un `run:` en Actions
+# (`bash --noprofile --norc -eo pipefail {0}`). Correr con `bash "$SCRIPT"` a
+# secas (sin `-e`) fue justamente lo que dejo pasar sin verse el hallazgo
+# CRITICO de /revisar-pr #19 -- confirmado 3/3 por los revisores (Seguridad,
+# Arquitectura, Calidad): con `-e` heredado, un `timeout ... gh pr checks`
+# en rojo abortaba el script ANTES de capturar `CHECKS_EXIT`, saltandose por
+# completo la rama que arma auto-merge igual. `set +e` dentro del propio
+# script (ver dependabot-automerge.yml) es lo que lo neutraliza -- esta
+# prueba solo es real si reproduce el `-e` que lo hubiera destapado.
+#
+# `timeout` se mockea: macOS no trae `timeout` de coreutils (el runner
+# `ubuntu-latest` real si). El mock ignora la duracion y ejecuta el comando
+# tal cual, para que la prueba corra igual en ambos SO.
+#
+# `jq` NO se mockea -- es una herramienta real, igual que en el runner.
 
 setup() {
   WORKFLOW="$BATS_TEST_DIRNAME/../workflows/dependabot-automerge.yml"
@@ -37,6 +49,12 @@ EOF
   chmod +x "$MOCKDIR/timeout"
 }
 
+run_step() {
+  run bash -eo pipefail "$SCRIPT"
+}
+
+# $1 = cuerpo del mock, un `case "$1 $2"` sobre los sub-comandos de gh que
+# le interesan a la prueba.
 write_gh_mock() {
   cat > "$MOCKDIR/gh" <<EOF
 #!/usr/bin/env bash
@@ -51,30 +69,31 @@ EOF
     case "$1 $2" in
       "pr checks") exit 0 ;;
       "pr merge") exit 0 ;;
-      "pr view") echo MERGED ;;
+      "api graphql") echo "{\"data\":{\"resource\":{\"state\":\"MERGED\",\"isInMergeQueue\":false}}}" ;;
     esac
   '
-  run bash "$SCRIPT"
+  run_step
   [ "$status" -eq 0 ]
   [[ "$output" != *"::error"* ]]
   grep -q "pr merge --auto" "$BATS_TEST_TMPDIR/gh.log"
 }
 
-@test "checks en rojo: arma auto-merge, exit 0, sin vigilancia ni ::error::" {
+@test "checks en rojo (bash -e real): arma auto-merge, exit 0, sin vigilancia ni ::error:: (regresion del hallazgo CRITICO)" {
   write_gh_mock '
     case "$1 $2" in
       "pr checks") exit 1 ;;
       "pr merge") exit 0 ;;
-      "pr view") echo OPEN ;;
+      "api graphql") echo "{\"data\":{\"resource\":{\"state\":\"OPEN\",\"isInMergeQueue\":false}}}" ;;
     esac
   '
-  run bash "$SCRIPT"
+  run_step
   [ "$status" -eq 0 ]
   [[ "$output" == *"Habilito auto-merge igual"* ]]
   [[ "$output" != *"::error"* ]]
-  # Con checks en rojo nunca debe llamar `gh pr view` (esa es la vigilancia
-  # posterior al armado exitoso, que aqui no corresponde).
-  ! grep -q "pr view" "$BATS_TEST_TMPDIR/gh.log"
+  grep -q "pr merge --auto" "$BATS_TEST_TMPDIR/gh.log"
+  # Con checks en rojo nunca debe llegar a la vigilancia (eso es solo tras
+  # armar con exito sobre checks verdes).
+  ! grep -q "api graphql" "$BATS_TEST_TMPDIR/gh.log"
 }
 
 @test "checks verdes pero el PR nunca se completa: exit 1, ::error:: y Job Summary (bug D-1275/D-1287)" {
@@ -82,11 +101,62 @@ EOF
     case "$1 $2" in
       "pr checks") exit 0 ;;
       "pr merge") exit 0 ;;
-      "pr view") echo OPEN ;;
+      "api graphql") echo "{\"data\":{\"resource\":{\"state\":\"OPEN\",\"isInMergeQueue\":false}}}" ;;
     esac
   '
-  run bash "$SCRIPT"
+  run_step
   [ "$status" -eq 1 ]
   [[ "$output" == *"::error title=Auto-merge armado sin completar"* ]]
   grep -q "auto-merge armado, sin completar" "$GITHUB_STEP_SUMMARY"
+}
+
+@test "checks verdes y el PR queda progresando en Merge Queue: NO es el bug, exit 0 sin ::error:: (hallazgo ALTO)" {
+  write_gh_mock '
+    case "$1 $2" in
+      "pr checks") exit 0 ;;
+      "pr merge") exit 0 ;;
+      "api graphql") echo "{\"data\":{\"resource\":{\"state\":\"OPEN\",\"isInMergeQueue\":true}}}" ;;
+    esac
+  '
+  run_step
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"::error"* ]]
+  [[ "$output" == *"progresando"* ]]
+}
+
+@test "gh api graphql falla (rate limit / red): reintenta con ::warning::, no confunde con 'nunca encolo'" {
+  cat > "$MOCKDIR/gh" <<EOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$BATS_TEST_TMPDIR/gh.log"
+case "\$1 \$2" in
+  "pr checks") exit 0 ;;
+  "pr merge") exit 0 ;;
+  "api graphql")
+    N=\$(grep -c "api graphql" "$BATS_TEST_TMPDIR/gh.log" 2>/dev/null || echo 0)
+    if [ "\$N" -le 1 ]; then
+      echo "fake rate limit error" >&2
+      exit 1
+    fi
+    echo '{"data":{"resource":{"state":"MERGED","isInMergeQueue":false}}}'
+    ;;
+esac
+EOF
+  chmod +x "$MOCKDIR/gh"
+  run_step
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"::warning::gh api graphql fallo"* ]]
+  [[ "$output" != *"::error"* ]]
+}
+
+@test "GRACE_SECONDS invalido: falla ruidoso, no silencioso (hallazgo BAJO)" {
+  export GRACE_SECONDS="no-numerico"
+  write_gh_mock '
+    case "$1 $2" in
+      "pr checks") exit 0 ;;
+      "pr merge") exit 0 ;;
+    esac
+  '
+  run_step
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::GRACE_SECONDS invalido"* ]]
 }

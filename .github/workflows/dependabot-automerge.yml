@@ -98,6 +98,13 @@ jobs:
     permissions:
       pull-requests: write
       contents: write
+      # `checks: read` + `statuses: read`: el nuevo step llama `gh pr
+      # checks`, que lee check-runs y commit-statuses -- con `permissions:`
+      # declarado, todo lo omitido queda en `none` (hallazgo de /revisar-pr
+      # #19: sin esto, `gh pr checks` puede fallar con "Resource not
+      # accessible by integration"). Solo lectura, no amplia nada.
+      checks: read
+      statuses: read
 
     steps:
       - name: Metadata de Dependabot
@@ -195,21 +202,40 @@ jobs:
         # timeline de merge_group VACIO para siempre -- confirmado 2/2, sin
         # que ayude esperar mas tiempo.
         #
-        # Por diseno (D-1287, decision de David): este step NUNCA mergea ni
-        # encola por si mismo -- "Que NO" del brief D-1275, nada de merge
-        # directo. `gh pr merge` solo se llama con `--auto`; la resolucion
-        # real de este atasco la hace `/merge-watchdog` con identidad humana
-        # (Paso 2ter, D-1287, ver merge-watchdog.md). Lo que este step aporta:
+        # Por diseno (D-1287, decision de David): este step NUNCA hace un
+        # merge/encolado EXPLICITO propio -- "Que NO" del brief D-1275, nada
+        # de `gh pr merge --merge`/`--squash`/`--rebase` sin `--auto`, nunca
+        # `--admin`. Solo se llama `gh pr merge --auto`, que puede resolver
+        # de inmediato si el PR YA cumple todo (comportamiento documentado y
+        # normal de GitHub en un repo SIN Merge Queue -- no es un bypass
+        # nuestro); en un repo CON Merge Queue es exactamente el mismo caso
+        # que hoy se atasca, asi que la resolucion real de ese atasco la hace
+        # `/merge-watchdog` con identidad humana (Paso 2ter, D-1287, ver
+        # merge-watchdog.md). Lo que este step aporta:
         # (1) esperar a que los checks REQUERIDOS resuelvan antes de pedir el
         # auto-merge, en vez de pedirlo a ciegas segundos despues de abrir el
         # PR -- deja el caso "no elegible por checks aun pendientes" separado
         # del caso "elegible pero estructuralmente atascado"; (2) vigilar
         # unos minutos si de todos modos se completo (repos SIN Merge Queue
         # si pueden terminar solos via GITHUB_TOKEN) -- si no, fallar este
-        # step (no es un check requerido, no bloquea el merge) para dejar
-        # rastro visible en la pestaña Checks del PR en vez de silencio
-        # durante dias, como paso con #431/#349 antes de este fix.
+        # step para dejar rastro visible en la pestaña Checks del PR en vez
+        # de silencio durante dias, como paso con #431/#349 antes de este
+        # fix. Este job ("automerge") no esta en el `required_status_checks`
+        # de ningun repo consumidor hoy (verificado en agente-conversacional
+        # y landing) -- si algun repo lo agrega como requerido a futuro, esta
+        # falla SI bloquearia el merge; confirmarlo en el ruleset del repo
+        # antes de asumirlo.
         run: |
+          # `-e` OFF a proposito: el shell default de un `run:` en Actions es
+          # `bash --noprofile --norc -eo pipefail {0}` -- con `-e` heredado,
+          # un `timeout ... gh pr checks` en rojo aborta el script ANTES de
+          # `CHECKS_EXIT=$?` y antes de habilitar auto-merge, saltandose la
+          # rama que maneja checks fallidos/timeout por completo (hallazgo
+          # CRITICO de /revisar-pr #19, reproducido con `bash -e` real:
+          # con `-e` solo corrio `gh pr checks`; sin `-e`, corrio tambien
+          # `gh pr merge`). `set -uo pipefail` NO apaga `-e` -- hay que
+          # apagarla explicito.
+          set +e
           set -uo pipefail
 
           # Ventana de gracia y polling parametrizados por env var (no por
@@ -218,6 +244,8 @@ jobs:
           # produccion siempre corren con el default.
           GRACE_SECONDS="${GRACE_SECONDS:-300}"
           GRACE_POLL_SECONDS="${GRACE_POLL_SECONDS:-20}"
+          case "${GRACE_SECONDS}" in ''|*[!0-9]*) echo "::error::GRACE_SECONDS invalido: '${GRACE_SECONDS}'"; exit 1 ;; esac
+          case "${GRACE_POLL_SECONDS}" in ''|*[!0-9]*|0) echo "::error::GRACE_POLL_SECONDS invalido (entero > 0): '${GRACE_POLL_SECONDS}'"; exit 1 ;; esac
 
           timeout "${WAIT_MINUTES}m" gh pr checks "$PR_URL" --watch --required --fail-fast --interval 15
           CHECKS_EXIT=$?
@@ -231,21 +259,48 @@ jobs:
           gh pr merge --auto --"${MERGE_METHOD}" "$PR_URL"
 
           # Ventana corta de vigilancia -- sin forzar nada (ver nota arriba).
+          # `state` sola no alcanza: un PR ya admitido a la cola sigue en
+          # OPEN hasta que el grupo termine de mergear (medido: mediana ~70s,
+          # outlier ~8.5min, reporte MW-20260926-0845) -- marcarlo "atascado"
+          # ahi seria un falso positivo (hallazgo ALTO de /revisar-pr #19).
+          # `isInMergeQueue` (GraphQL) distingue "progresando en la cola" de
+          # "nunca entro".
           GRACE_DEADLINE=$(( $(date +%s) + GRACE_SECONDS ))
           while [ "$(date +%s)" -lt "${GRACE_DEADLINE}" ]; do
-            STATE=$(gh pr view "$PR_URL" --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+            READ_ERR="$(mktemp)"
+            # $url es variable GraphQL, no de bash -- no debe expandirse aca, viaja por `-f url=`.
+            # shellcheck disable=SC2016
+            PR_JSON=$(gh api graphql -f query='query($url:URI!){ resource(url:$url){ ... on PullRequest { state isInMergeQueue } } }' -f url="$PR_URL" 2>"$READ_ERR")
+            GH_EXIT=$?
+            if [ "${GH_EXIT}" -ne 0 ]; then
+              echo "::warning::gh api graphql fallo consultando estado del PR (exit=${GH_EXIT}): $(cat "$READ_ERR")"
+              rm -f "$READ_ERR"
+              sleep "${GRACE_POLL_SECONDS}"
+              continue
+            fi
+            rm -f "$READ_ERR"
+            STATE=$(echo "${PR_JSON}" | jq -r '.data.resource.state // "UNKNOWN"')
+            IN_QUEUE=$(echo "${PR_JSON}" | jq -r '.data.resource.isInMergeQueue // false')
             if [ "${STATE}" = "MERGED" ]; then
               echo "::notice::Mergeado (via auto-merge/cola) dentro de la ventana de gracia."
               exit 0
             fi
+            if [ "${IN_QUEUE}" = "true" ]; then
+              echo "::notice::En Merge Queue, progresando -- no es el bug D-1275/D-1287. Sigo vigilando."
+            fi
             sleep "${GRACE_POLL_SECONDS}"
           done
 
-          echo "::error title=Auto-merge armado sin completar (D-1275/D-1287)::Checks requeridos en verde, auto-merge habilitado hace >5min, PR sin mergear ni encolar -- GITHUB_TOKEN no puede encolar en Merge Queue (causa confirmada, ver comentario del step). Lo resuelve /merge-watchdog (Paso 2ter, identidad humana) en su proxima pasada, o gh pr merge --merge manual: ${PR_URL}"
+          if [ "${IN_QUEUE:-false}" = "true" ]; then
+            echo "::notice::Sigue en Merge Queue al cierre de la ventana de gracia (${GRACE_SECONDS}s) -- progresando, no es el bug. No alerto."
+            exit 0
+          fi
+
+          echo "::error title=Auto-merge armado sin completar (D-1275/D-1287)::Checks requeridos en verde, auto-merge habilitado hace >${GRACE_SECONDS}s, PR sin mergear ni encolar -- GITHUB_TOKEN no puede encolar en Merge Queue (causa confirmada, ver comentario del step). Lo resuelve /merge-watchdog (Paso 2ter, identidad humana) en su proxima pasada, o gh pr merge --${MERGE_METHOD} manual: ${PR_URL}"
           {
             echo "## D-1275/D-1287 -- auto-merge armado, sin completar"
-            echo "Checks requeridos en verde. Auto-merge habilitado hace mas de 5 minutos."
+            echo "Checks requeridos en verde. Auto-merge habilitado hace mas de ${GRACE_SECONDS}s."
             echo "GITHUB_TOKEN no puede encolar en Merge Queue -- causa confirmada (GitHub Docs, Automating Dependabot with GitHub Actions), no es un caso aislado."
-            echo "Lo resuelve /merge-watchdog (Paso 2ter, D-1287) en su proxima pasada, o \`gh pr merge --merge ${PR_URL}\` manual."
+            echo "Lo resuelve /merge-watchdog (Paso 2ter, D-1287) en su proxima pasada, o \`gh pr merge --${MERGE_METHOD} ${PR_URL}\` manual."
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
