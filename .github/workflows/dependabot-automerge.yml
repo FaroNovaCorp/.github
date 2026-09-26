@@ -70,12 +70,22 @@ on:
     inputs:
       merge_method:
         description: >-
-          Metodo para `gh pr merge --auto`: merge, squash o rebase. Debe
-          coincidir con lo que el repo caller tiene habilitado
+          Metodo para `gh pr merge`: merge, squash o rebase. Debe coincidir
+          con lo que el repo caller tiene habilitado
           (Settings > General > Pull Requests) o el comando falla.
         required: false
         type: string
         default: "merge"
+      wait_timeout_minutes:
+        description: >-
+          Minutos que este job espera a que los checks REQUERIDOS del PR
+          resuelvan antes de habilitar auto-merge (D-1275 — ver nota en el
+          step "Esperar checks..."). Default cubre lo medido (mediana ~70s,
+          outlier ~8.5min en agente-de-monitoreo, reporte
+          MW-20260926-0845) con margen. Repos con CI mas lenta pueden subirlo.
+        required: false
+        type: number
+        default: 20
 
 jobs:
   automerge:
@@ -166,12 +176,76 @@ jobs:
               ;;
           esac
 
-      - name: Habilitar auto-merge
+      - name: Esperar checks y habilitar auto-merge
         if: steps.gate.outputs.eligible == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_METHOD: ${{ inputs.merge_method }}
+          WAIT_MINUTES: ${{ inputs.wait_timeout_minutes }}
+        # D-1275/D-1287 (medido en #431 agente-conversacional y #349 landing,
+        # 26-sep-2026, timeline GraphQL + check-runs de los dos PR): en un
+        # repo con Merge Queue, `GITHUB_TOKEN` NO PUEDE encolar un PR -- causa
+        # confirmada por GitHub Docs, "Automating Dependabot with GitHub
+        # Actions": "If the target branch uses a merge queue, the built-in
+        # GITHUB_TOKEN cannot add pull requests to the queue." `gh pr merge
+        # --auto` arma el flag (eso si lo permite el token) pero la
+        # conversion flag -> cola nunca ocurre: el PR queda con
+        # autoMergeRequest activo, checks requeridos en SUCCESS, y el
+        # timeline de merge_group VACIO para siempre -- confirmado 2/2, sin
+        # que ayude esperar mas tiempo.
+        #
+        # Por diseno (D-1287, decision de David): este step NUNCA mergea ni
+        # encola por si mismo -- "Que NO" del brief D-1275, nada de merge
+        # directo. `gh pr merge` solo se llama con `--auto`; la resolucion
+        # real de este atasco la hace `/merge-watchdog` con identidad humana
+        # (Paso 2ter, D-1287, ver merge-watchdog.md). Lo que este step aporta:
+        # (1) esperar a que los checks REQUERIDOS resuelvan antes de pedir el
+        # auto-merge, en vez de pedirlo a ciegas segundos despues de abrir el
+        # PR -- deja el caso "no elegible por checks aun pendientes" separado
+        # del caso "elegible pero estructuralmente atascado"; (2) vigilar
+        # unos minutos si de todos modos se completo (repos SIN Merge Queue
+        # si pueden terminar solos via GITHUB_TOKEN) -- si no, fallar este
+        # step (no es un check requerido, no bloquea el merge) para dejar
+        # rastro visible en la pestaña Checks del PR en vez de silencio
+        # durante dias, como paso con #431/#349 antes de este fix.
         run: |
-          # En repos CON Merge Queue esto equivale a "Merge when ready" y
-          # encola; el merge directo devuelve HTTP 405 y eso es lo esperado.
-          gh pr merge --auto --${{ inputs.merge_method }} "$PR_URL"
+          set -uo pipefail
+
+          # Ventana de gracia y polling parametrizados por env var (no por
+          # input del workflow_call -- son detalle interno) solo para que
+          # `.github/tests/dependabot-automerge.bats` los pueda achicar; en
+          # produccion siempre corren con el default.
+          GRACE_SECONDS="${GRACE_SECONDS:-300}"
+          GRACE_POLL_SECONDS="${GRACE_POLL_SECONDS:-20}"
+
+          timeout "${WAIT_MINUTES}m" gh pr checks "$PR_URL" --watch --required --fail-fast --interval 15
+          CHECKS_EXIT=$?
+
+          if [ "${CHECKS_EXIT}" -ne 0 ]; then
+            echo "::notice::Checks requeridos no resolvieron en verde dentro de ${WAIT_MINUTES}min (exit=${CHECKS_EXIT}). Habilito auto-merge igual -- sin cambios de comportamiento: espera a que resuelvan solos o a una persona."
+            gh pr merge --auto --"${MERGE_METHOD}" "$PR_URL"
+            exit 0
+          fi
+
+          gh pr merge --auto --"${MERGE_METHOD}" "$PR_URL"
+
+          # Ventana corta de vigilancia -- sin forzar nada (ver nota arriba).
+          GRACE_DEADLINE=$(( $(date +%s) + GRACE_SECONDS ))
+          while [ "$(date +%s)" -lt "${GRACE_DEADLINE}" ]; do
+            STATE=$(gh pr view "$PR_URL" --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+            if [ "${STATE}" = "MERGED" ]; then
+              echo "::notice::Mergeado (via auto-merge/cola) dentro de la ventana de gracia."
+              exit 0
+            fi
+            sleep "${GRACE_POLL_SECONDS}"
+          done
+
+          echo "::error title=Auto-merge armado sin completar (D-1275/D-1287)::Checks requeridos en verde, auto-merge habilitado hace >5min, PR sin mergear ni encolar -- GITHUB_TOKEN no puede encolar en Merge Queue (causa confirmada, ver comentario del step). Lo resuelve /merge-watchdog (Paso 2ter, identidad humana) en su proxima pasada, o gh pr merge --merge manual: ${PR_URL}"
+          {
+            echo "## D-1275/D-1287 -- auto-merge armado, sin completar"
+            echo "Checks requeridos en verde. Auto-merge habilitado hace mas de 5 minutos."
+            echo "GITHUB_TOKEN no puede encolar en Merge Queue -- causa confirmada (GitHub Docs, Automating Dependabot with GitHub Actions), no es un caso aislado."
+            echo "Lo resuelve /merge-watchdog (Paso 2ter, D-1287) en su proxima pasada, o \`gh pr merge --merge ${PR_URL}\` manual."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
