@@ -10,10 +10,17 @@ name: verificar-acciones
 # - Regla `workflows` de rulesets: ignora filtros `paths`, corre siempre. Por
 #   eso el filtro va adentro: PR sin workflows ni action.yml cambiados → verde
 #   en segundos, sin instalar nada.
-# - Bloquea solo pares acción@SHA nuevos del PR. Lo que ya estaba en main se
-#   avisa aquí y lo detecta la revisión semanal de /cambios-criticos.
+# - Mide lo que el PR mete en main: merge de prueba contra su primer padre
+#   (PR) o base de la cola (merge_group). Un PR atrasado no hereda como suyos
+#   los cambios que main hizo en sus workflows.
+# - Bloquea solo pares acción@SHA nuevos. Lo que ya estaba en main avisa aquí
+#   y lo detecta la revisión semanal de /cambios-criticos (patrón 8).
 # - Nunca hace checkout ni ejecuta código del PR: lee el diff por API.
 # - Sin `concurrency`/`cancel-in-progress`: la doc de rulesets lo desaconseja.
+# - Límites: reusables de OTRO repo privado de la org dan rojo (el GITHUB_TOKEN
+#   no los ve); hoy solo se usa FaroNovaCorp/.github, que es público. No frena
+#   la ejecución de un impostor en el CI del propio PR: eso es la política de
+#   lockfiles (plan, F5).
 # Plan: docs/planes-de-trabajo/pendientes/proteccion-commits-impostores/plan.md
 # Tests: python3 -m unittest discover -s .github/tests -p 'test_*.py'
 
@@ -28,33 +35,37 @@ jobs:
   verificar:
     name: verificar
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Verificar acciones
         shell: python3 -I {0}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          """Verifica que todo `uses:` nuevo del PR salga de una rama del repo dueño.
+          """Verifica que todo `uses:` nuevo salga de una rama del repo dueño.
 
-          Por cada par acción@SHA que el PR agrega a un workflow o action.yml:
+          Por cada par acción@SHA que el cambio agrega a un workflow o action.yml:
           - SHA completo de 40 caracteres.
           - El commit existe en el repo dueño y es alcanzable desde una RAMA
-            suya (rama por defecto primero, luego releases). Solo-fork
-            (impostor) o solo-tag (tag movido fuera de la historia) → rojo.
-          - Reusables propios (FaroNovaCorp/*): en la rama por defecto.
-          - Comentario de versión: el tag que nombra apunta a ese SHA. Terceros
-            sin versión → rojo.
+            suya (rama por defecto primero, luego releases, luego el resto).
+            Solo-fork (impostor) o solo-tag (tag movido fuera de la historia)
+            → rojo. Búsqueda que no termina → rojo, con su motivo.
+          - Reusables propios (FaroNovaCorp/*): en la rama por defecto; el
+            comentario es libre.
+          - Terceros: el comentario nombra un tag que apunta a ese SHA (`# vN`
+            vale si algún `vN.x` apunta a él). Sin versión → rojo.
           - El par aparece literal en una línea añadida (corta escapes YAML,
-            alias y multilínea que esconden el valor real).
-          - zizmor (--no-config --no-ignores): impostor-commit y
-            ref-version-mismatch en línea añadida → rojo; en línea previa o si
-            zizmor no puede leer el archivo → aviso (la verificación propia
-            cubre lo mismo).
+            alias y multilínea que esconden el valor real). Claves duplicadas
+            → rojo.
+          - Enlace simbólico o submódulo bajo `.github/` o como action.yml → rojo.
+          - zizmor (--no-config --no-ignores): impostor-commit en la línea de un
+            par nuevo → rojo; ref-version-mismatch, líneas previas o zizmor que
+            no lee el archivo → aviso (la verificación propia es la autoridad).
           """
           import base64
           import difflib
           import glob
+          import http.client
           import json
           import os
           import re
@@ -65,6 +76,7 @@ jobs:
           import urllib.error
           import urllib.parse
           import urllib.request
+          from concurrent.futures import ThreadPoolExecutor
 
           API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
           ORG = "faronovacorp"
@@ -77,8 +89,8 @@ jobs:
           VER_RE = re.compile(
               r"(?:^|[\s=@(:])((?:v\d+(?:\.\d+)*|\d+(?:\.\d+)+)(?:-[0-9A-Za-z][0-9A-Za-z.]*)?)(?![\w.-])"
           )
-          AUDITORIAS = ("impostor-commit", "ref-version-mismatch")
-          MAX_RAMAS = 40
+          MAX_RAMAS = 300
+          LOTE = 8
           TMP = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
           VENV = os.path.join(TMP, "verificar-acciones-venv")
           # Versiones fijas por hash (pip --require-hashes). zizmor: wheel
@@ -107,19 +119,23 @@ jobs:
                   "User-Agent": "faronova-verificar-acciones",
               })
               for intento in range(4):
+                  espera = 2 ** intento
                   try:
                       with urllib.request.urlopen(req, timeout=30) as r:
                           return r.status, r.read(), r.headers
                   except urllib.error.HTTPError as e:
+                      e.close()
                       if e.code in (404, 409, 422):
                           return e.code, b"", e.headers
-                      espera = e.headers.get("Retry-After")
-                      if e.code >= 500 or (e.code in (403, 429) and espera):
-                          time.sleep(min(int(espera or 2 ** intento), 30))
-                          continue
-                      raise ErrorApi(f"HTTP {e.code} en {url}") from None
-                  except (urllib.error.URLError, TimeoutError):
-                      time.sleep(2 ** intento)
+                      if e.code in (403, 429) and e.headers.get("X-RateLimit-Remaining") == "0":
+                          raise ErrorApi(f"límite de la API de GitHub agotado en {url}") from None
+                      if e.code < 500 and not (e.code in (403, 429) and e.headers.get("Retry-After")):
+                          raise ErrorApi(f"HTTP {e.code} en {url}") from None
+                      espera = min(int(e.headers.get("Retry-After") or espera), 30)
+                  except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
+                      pass
+                  if intento < 3:
+                      time.sleep(espera)
               raise ErrorApi(f"sin respuesta de {url}")
 
 
@@ -140,7 +156,7 @@ jobs:
               return items
 
 
-          # ---------------------------------------------------- qué cambió el PR
+          # ---------------------------------------------------- qué cambió
 
           def es_relevante(ruta):
               r = ruta.lower()
@@ -150,32 +166,75 @@ jobs:
                       and r.endswith((".yml", ".yaml")))
 
 
-          def shas_del_evento():
+          def es_sensible(ruta):
+              r = ruta.lower()
+              return r == ".github" or r.startswith(".github/") or es_relevante(r)
+
+
+          def shas_del_evento(repo):
+              """(base, head) de lo que el cambio mete en main."""
               with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
                   ev = json.load(f)
               nombre = os.environ["GITHUB_EVENT_NAME"]
-              if nombre in ("pull_request", "pull_request_target"):
-                  return ev["pull_request"]["base"]["sha"], ev["pull_request"]["head"]["sha"]
               if nombre == "merge_group":
                   return ev["merge_group"]["base_sha"], ev["merge_group"]["head_sha"]
-              raise ErrorApi(f"evento no soportado: {nombre}")
+              if nombre not in ("pull_request", "pull_request_target"):
+                  raise ErrorApi(f"evento no soportado: {nombre}")
+              # En pull_request, GITHUB_SHA es el merge de prueba (refs/pull/N/merge):
+              # sus padres son [punta de la base, head del PR].
+              head = os.environ["GITHUB_SHA"]
+              st, c = api(f"repos/{repo}/git/commits/{head}")
+              if st != 200:
+                  raise ErrorApi(f"no se pudo leer el commit {head[:12]} (HTTP {st})")
+              padres = [p["sha"] for p in c.get("parents", [])]
+              if len(padres) == 2:
+                  return padres[0], head
+              pr = ev["pull_request"]
+              st, d = api(f"repos/{repo}/compare/{pr['base']['sha']}...{pr['head']['sha']}?per_page=1")
+              if st != 200:
+                  raise ErrorApi(f"no se pudo calcular el merge-base (HTTP {st})")
+              return d["merge_base_commit"]["sha"], pr["head"]["sha"]
 
 
-          def arbol(repo, sha):
-              st, d = api(f"repos/{repo}/git/trees/{sha}?recursive=1")
+          def entradas(repo, sha):
+              if not sha:
+                  return {}
+              st, d = api(f"repos/{repo}/git/trees/{sha}")
               if st != 200:
                   raise ErrorApi(f"no se pudo leer el árbol {sha[:12]} (HTTP {st})")
               if d.get("truncated"):
-                  raise ErrorApi(f"árbol {sha[:12]} truncado por GitHub: no se puede listar completo")
-              return {e["path"]: e["sha"] for e in d["tree"]
-                      if e["type"] == "blob" and es_relevante(e["path"])}
+                  raise ErrorApi(f"árbol {sha[:12]} truncado por GitHub")
+              return {e["path"]: e for e in d["tree"]}
 
 
           def detectar(repo, base, head):
-              """Archivos relevantes nuevos o modificados de base a head."""
-              ab, ah = arbol(repo, base), arbol(repo, head)
-              return [{"ruta": p, "base": ab.get(p), "head": s}
-                      for p, s in sorted(ah.items()) if ab.get(p) != s]
+              """Diff de árboles incremental: baja solo a los directorios que cambiaron.
+
+              Devuelve (cambios, prohibidos): archivos relevantes nuevos o modificados, y
+              enlaces simbólicos o submódulos nuevos o modificados en rutas sensibles.
+              """
+              cambios, prohibidos, nivel = [], [], [("", base, head)]
+              with ThreadPoolExecutor(LOTE) as ex:
+                  while nivel:
+                      leidos = ex.map(lambda t: (t[0], entradas(repo, t[1]), entradas(repo, t[2])), nivel)
+                      nivel = []
+                      for prefijo, eb, eh in leidos:
+                          for nombre, e in eh.items():
+                              ruta, previo = prefijo + nombre, eb.get(nombre)
+                              if previo and previo["sha"] == e["sha"] and previo["mode"] == e["mode"]:
+                                  continue
+                              if e["type"] == "tree":
+                                  nivel.append((ruta + "/", previo["sha"] if previo and previo["type"] == "tree"
+                                                else None, e["sha"]))
+                              elif e["mode"] == "120000" or e["type"] == "commit":
+                                  if es_sensible(ruta):
+                                      prohibidos.append((ruta, "enlace simbólico" if e["mode"] == "120000"
+                                                         else "submódulo"))
+                              elif e["type"] == "blob" and es_relevante(ruta):
+                                  base_blob = (previo["sha"] if previo and previo["type"] == "blob"
+                                               and previo["mode"] != "120000" else None)
+                                  cambios.append({"ruta": ruta, "base": base_blob, "head": e["sha"]})
+              return sorted(cambios, key=lambda c: c["ruta"]), sorted(prohibidos)
 
 
           def blob(repo, sha):
@@ -197,6 +256,33 @@ jobs:
               return nuevas
 
 
+          def cargar_yaml(texto):
+              """safe_load que además rechaza claves duplicadas (PyYAML se queda con la última)."""
+              import yaml
+
+              class Cargador(yaml.SafeLoader):
+                  pass
+
+              def mapa(loader, nodo, deep=False):
+                  vistas = set()
+                  for k, _v in nodo.value:
+                      if k.tag == "tag:yaml.org,2002:merge":
+                          continue
+                      clave = loader.construct_object(k, deep=True)
+                      try:
+                          repetida = clave in vistas
+                          vistas.add(clave)
+                      except TypeError:
+                          continue
+                      if repetida:
+                          raise yaml.constructor.ConstructorError(
+                              None, None, f"clave duplicada {clave!r}", k.start_mark)
+                  return yaml.SafeLoader.construct_mapping(loader, nodo, deep)
+
+              Cargador.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapa)
+              return yaml.load(texto, Loader=Cargador)
+
+
           def usos(doc):
               """Todos los valores de claves `uses`, en cualquier nivel."""
               out, vistos, pila = [], set(), [doc]
@@ -215,12 +301,16 @@ jobs:
               return out
 
 
+          def _buscar(uso, linea):
+              return re.search(r"(?<![\w./-])" + re.escape(uso) + r"(?![\w./@-])", linea)
+
+
           def aparece(uso, linea):
-              return re.search(r"(?<![\w./-])" + re.escape(uso) + r"(?![\w./@-])", linea) is not None
+              return _buscar(uso, linea) is not None
 
 
           def comentario(linea, uso):
-              m = re.search(r"(?<![\w./-])" + re.escape(uso) + r"(?![\w./@-])", linea)
+              m = _buscar(uso, linea)
               resto = linea[m.end():] if m else ""
               c = re.search(r"(?:^|\s)#\s*(.*)$", resto.lstrip("'\""))
               return c.group(1).strip() if c else ""
@@ -232,6 +322,7 @@ jobs:
               def __init__(self):
                   self._alcance = {}
                   self._tags = {}
+                  self._lista_tags = {}
 
               def contiene(self, repo, rama, sha):
                   st, d = api(f"repos/{repo}/compare/{urllib.parse.quote(rama, safe='/')}...{sha}?per_page=1")
@@ -258,17 +349,21 @@ jobs:
                               f"mergeado en {full}")
                   ramas = [r for r in api_paginado(f"repos/{full}/branches?per_page=100")
                            if r["name"] != rama_def]
+                  if any(r["commit"]["sha"] == sha for r in ramas):
+                      return None
                   ramas.sort(key=lambda r: (
                       0 if re.match(r"(releases?[/-]|v\d)", r["name"]) else
                       1 if r["name"] in ("main", "master", "develop") else 2, r["name"]))
-                  if any(r["commit"]["sha"] == sha for r in ramas):
-                      return None
-                  for r in ramas[:MAX_RAMAS]:
-                      if self.contiene(full, r["name"], sha):
-                          return None
-                  extra = (f" (revisadas {MAX_RAMAS} de {len(ramas)} ramas)"
-                           if len(ramas) > MAX_RAMAS else "")
-                  return (f"el commit {sha[:12]} no está en ninguna rama de {full}{extra}: "
+                  revisar = ramas[:MAX_RAMAS]
+                  with ThreadPoolExecutor(LOTE) as ex:
+                      for i in range(0, len(revisar), LOTE):
+                          lote = revisar[i:i + LOTE]
+                          if any(ex.map(lambda r: self.contiene(full, r["name"], sha), lote)):
+                              return None
+                  if len(ramas) >= MAX_RAMAS:
+                      return (f"búsqueda incompleta: {full} tiene {len(ramas)}+ ramas y el commit "
+                              f"{sha[:12]} no está en las {len(revisar)} revisadas; pide revisión a un owner")
+                  return (f"el commit {sha[:12]} no está en ninguna rama de {full}: "
                           f"commit de un fork (impostor) o tag movido fuera de la historia")
 
               def tag_commit(self, full, tag):
@@ -291,25 +386,43 @@ jobs:
                   self._tags[clave] = res
                   return res
 
+              def tags_de(self, full):
+                  if full.lower() not in self._lista_tags:
+                      self._lista_tags[full.lower()] = {
+                          t["name"]: t["commit"]["sha"] for t in api_paginado(f"repos/{full}/tags?per_page=100")}
+                  return self._lista_tags[full.lower()]
+
               def version(self, dueno, repo, sha, texto):
+                  if dueno.lower() == ORG:
+                      return None
                   m = VER_RE.search(texto or "")
                   if not m:
-                      if dueno.lower() == ORG:
-                          return None
                       return ("sin versión en el comentario: escribe `# vX.Y.Z` con el tag "
                               "que apunta a ese SHA")
                   v = m.group(1)
                   full = f"{dueno}/{repo}"
+                  existe = None
                   for tag in (v, v[1:] if v.startswith("v") else "v" + v):
                       t = self.tag_commit(full, tag)
-                      if t is not None:
-                          if t == sha:
-                              return None
-                          return f"el comentario dice {tag}, pero {tag} apunta a {t[:12]}, no a {sha[:12]}"
+                      if t == sha:
+                          return None
+                      if t is not None and existe is None:
+                          existe = (tag, t)
+                  # `# v7` (solo mayor): vale si algún v7.x apunta a ese SHA; el tag
+                  # flotante v7 se mueve con cada release.
+                  if re.fullmatch(r"v?\d+", v):
+                      familia = (v if v.startswith("v") else "v" + v) + "."
+                      if any(n.startswith((familia, familia[1:])) and s == sha
+                             for n, s in self.tags_de(full).items()):
+                          return None
+                  if existe:
+                      return (f"el comentario dice {existe[0]}, pero {existe[0]} apunta a "
+                              f"{existe[1][:12]}, no a {sha[:12]}")
                   return f"el comentario dice {v}, pero ese tag no existe en {full}"
 
               def revisar_uso(self, ruta, uso, lineas):
                   n0 = lineas[0][0]
+                  # `$/` = acción local en la sintaxis de los lockfiles (`gh actions-lock`).
                   if uso.startswith(("./", "$/")):
                       return []
                   if uso.startswith("docker://"):
@@ -340,20 +453,21 @@ jobs:
 
 
           def revisar_archivo(ruta, base_txt, head_txt, verif):
+              """(hallazgos, líneas donde aparece algún par nuevo)."""
               import yaml
               try:
-                  doc = yaml.safe_load(head_txt)
+                  doc = cargar_yaml(head_txt)
               except yaml.YAMLError as e:
                   marca = getattr(e, "problem_mark", None)
                   return [hallazgo("error", ruta, marca.line + 1 if marca else None, None,
-                                   f"YAML que no se puede leer: {getattr(e, 'problem', None) or e}")]
+                                   f"YAML que no se puede leer: {getattr(e, 'problem', None) or e}")], set()
               try:
-                  previos = {u for u in usos(yaml.safe_load(base_txt)) if isinstance(u, str)} if base_txt else set()
+                  previos = {u for u in usos(cargar_yaml(base_txt)) if isinstance(u, str)} if base_txt else set()
               except yaml.YAMLError:
                   previos = set()
               lineas = head_txt.splitlines()
               nuevas = sorted(lineas_nuevas(base_txt, head_txt))
-              out, vistos = [], set()
+              out, vistos, de_pares_nuevos = [], set(), set()
               for uso in usos(doc):
                   if not isinstance(uso, str):
                       out.append(hallazgo("error", ruta, None, None, "`uses` que no es texto"))
@@ -367,8 +481,9 @@ jobs:
                                           "uso nuevo que no aparece literal en una línea añadida "
                                           "(escape, alias o multilínea): escríbelo en una sola línea"))
                       continue
+                  de_pares_nuevos.update(n for n, _ in donde)
                   out += verif.revisar_uso(ruta, uso, donde)
-              return out
+              return out, de_pares_nuevos
 
 
           # ------------------------------------------------------------- zizmor
@@ -380,22 +495,26 @@ jobs:
                   f.write(REQUISITOS)
               subprocess.run([os.path.join(VENV, "bin", "pip"), "install", "--quiet",
                               "--disable-pip-version-check", "--no-deps", "--only-binary", ":all:",
-                              "--require-hashes", "-r", req], check=True)
+                              "--require-hashes", "-r", req], check=True, timeout=300)
               sys.path.insert(0, glob.glob(os.path.join(VENV, "lib", "python3*", "site-packages"))[0])
 
 
           def correr_zizmor(archivo):
               """Lista de (auditoría, fila_ini, fila_fin, descripción), o None si zizmor falla."""
-              r = subprocess.run(
-                  [os.path.join(VENV, "bin", "zizmor"), "--no-config", "--no-ignores", "--no-progress",
-                   "--no-exit-codes", "--format", "json",
-                   "--cache-dir", os.path.join(TMP, "verificar-acciones-zizmor-cache"), archivo],
-                  capture_output=True, text=True, timeout=300)
-              if r.returncode != 0:
+              try:
+                  r = subprocess.run(
+                      [os.path.join(VENV, "bin", "zizmor"), "--no-config", "--no-ignores", "--no-progress",
+                       "--no-exit-codes", "--format", "json",
+                       "--cache-dir", os.path.join(TMP, "verificar-acciones-zizmor-cache"), archivo],
+                      capture_output=True, text=True, timeout=120)
+                  if r.returncode != 0:
+                      return None
+                  hallados = json.loads(r.stdout or "[]")
+              except (subprocess.TimeoutExpired, ValueError):
                   return None
               out = []
-              for f in json.loads(r.stdout or "[]"):
-                  if f.get("ident") not in AUDITORIAS:
+              for f in hallados:
+                  if f.get("ident") not in ("impostor-commit", "ref-version-mismatch"):
                       continue
                   for loc in f.get("locations", []):
                       if (loc.get("symbolic") or {}).get("kind", "Primary") != "Primary":
@@ -406,7 +525,7 @@ jobs:
               return out
 
 
-          def revisar_zizmor(ruta, base_txt, head_txt, carpeta):
+          def revisar_zizmor(ruta, head_txt, carpeta, de_pares_nuevos):
               destino = os.path.join(carpeta, ruta)
               os.makedirs(os.path.dirname(destino), exist_ok=True)
               with open(destino, "w", encoding="utf-8") as f:
@@ -415,12 +534,13 @@ jobs:
               if res is None:
                   return [hallazgo("aviso", ruta, None, None,
                                    "zizmor no pudo auditar el archivo; la verificación propia lo cubrió")]
-              nuevas = lineas_nuevas(base_txt, head_txt)
               out = []
               for ident, ini, fin, desc in res:
-                  nuevo = any(n in nuevas for n in range(ini, fin + 1))
-                  out.append(hallazgo("error" if nuevo else "aviso", ruta, ini, None,
-                                      f"zizmor {ident}: {desc}" + ("" if nuevo else " (ya estaba en la base)")))
+                  nuevo = any(n in de_pares_nuevos for n in range(ini, fin + 1))
+                  bloquea = nuevo and ident == "impostor-commit"
+                  nota = "" if nuevo else " (par que ya estaba en main)"
+                  out.append(hallazgo("error" if bloquea else "aviso", ruta, ini, None,
+                                      f"zizmor {ident}: {desc}{nota}"))
               return out
 
 
@@ -438,7 +558,7 @@ jobs:
               return re.sub(r"[`|\r\n]", " ", str(t))
 
 
-          def informar(hallazgos, cambios):
+          def informar(hallazgos, n_archivos):
               for h in hallazgos:
                   tipo = "error" if h["nivel"] == "error" else "warning"
                   props = f"file={_prop(h['ruta'])}" + (f",line={h['linea']}" if h["linea"] else "")
@@ -448,7 +568,7 @@ jobs:
               filas = [f"| {'❌' if h['nivel'] == 'error' else '⚠️'} | {_celda(h['ruta'])}:{h['linea'] or '-'} "
                        f"| `{_celda(h['uso'] or '-')}` | {_celda(h['motivo'])} |" for h in hallazgos]
               lineas = [f"## verificar-acciones — {'ROJO' if errores else 'VERDE'}", "",
-                        f"Archivos revisados: {len(cambios)} · errores: {errores} · "
+                        f"Archivos revisados: {n_archivos} · errores: {errores} · "
                         f"avisos: {len(hallazgos) - errores}", ""]
               if filas:
                   lineas += ["| | Archivo | uses | Motivo |", "|---|---|---|---|", *filas]
@@ -468,13 +588,20 @@ jobs:
           def main():
               repo = os.environ["GITHUB_REPOSITORY"]
               try:
-                  base, head = shas_del_evento()
-                  cambios = detectar(repo, base, head)
+                  base, head = shas_del_evento(repo)
+                  print(f"base {base} · head {head}")
+                  cambios, prohibidos = detectar(repo, base, head)
+                  hallazgos = [hallazgo("error", r, None, None,
+                                        f"{tipo} en una ruta de workflows o acciones: no se permite "
+                                        "(el contenido real queda fuera de la verificación)")
+                               for r, tipo in prohibidos]
                   if not cambios:
-                      resumen("## verificar-acciones — VERDE\n\nSin cambios en workflows ni en action.yml.")
-                      return 0
+                      if not hallazgos:
+                          resumen("## verificar-acciones — VERDE\n\nSin cambios en workflows ni en action.yml.")
+                          return 0
+                      return 1 if informar(hallazgos, 0) else 0
                   instalar()
-                  verif, hallazgos = Verificador(), []
+                  verif = Verificador()
                   with tempfile.TemporaryDirectory() as carpeta:
                       for c in cambios:
                           try:
@@ -483,9 +610,10 @@ jobs:
                           except UnicodeDecodeError:
                               hallazgos.append(hallazgo("error", c["ruta"], None, None, "archivo que no es UTF-8"))
                               continue
-                          hallazgos += revisar_archivo(c["ruta"], base_txt, head_txt, verif)
-                          hallazgos += revisar_zizmor(c["ruta"], base_txt, head_txt, carpeta)
-                  return 1 if informar(hallazgos, cambios) else 0
+                          propios, de_pares_nuevos = revisar_archivo(c["ruta"], base_txt, head_txt, verif)
+                          hallazgos += propios
+                          hallazgos += revisar_zizmor(c["ruta"], head_txt, carpeta, de_pares_nuevos)
+                  return 1 if informar(hallazgos, len(cambios)) else 0
               except (ErrorApi, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                   print(f"::error title=verificar-acciones::{_dato(f'no se pudo verificar, sin verificar no entra: {e}')}")
                   return 1

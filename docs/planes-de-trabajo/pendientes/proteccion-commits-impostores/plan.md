@@ -84,16 +84,18 @@ Secundarios:
 ### F1 · Workflow `verificar-acciones.yml`
 
 - Triggers `pull_request` + `merge_group`; sin `cancel-in-progress`; `contents: read`; `ubuntu-24.04`; sin checkout del código del PR.
-- Lista de archivos por API (PR: `pulls/N/files`; cola: `compare`). Relevantes: `*.yml|*.yaml` bajo `.github/`, `action.yml|action.yaml` en cualquier ruta. Sin relevantes → verde.
-- Contenido head y merge-base por API. YAML con PyYAML (venv, `--require-hashes`).
+- Qué mete el cambio en main: PR → merge de prueba (`GITHUB_SHA`) contra su primer padre; cola → `base_sha`…`head_sha`. Un PR atrasado no hereda los cambios de main.
+- Diff de árboles incremental por API (solo directorios que cambiaron; sin el tope de 7 MB del árbol recursivo). Relevantes: `.github/workflows/*.yml|yaml` de primer nivel (los únicos que GitHub carga) y `action.yml|action.yaml` en cualquier ruta. Sin relevantes → verde sin instalar nada.
+- Enlace simbólico o submódulo nuevo bajo `.github/` o como `action.yml` → rojo (hoy: 0 en la org).
+- YAML con PyYAML (venv, `--require-hashes`); claves duplicadas → rojo.
 - Pares nuevos = `uses` de head que no estaban en la base. Por cada uno:
   - SHA completo de 40.
   - Commit existe en el repo dueño.
-  - Alcanzable desde una RAMA del dueño (rama por defecto primero, luego releases). Solo-tag o solo-fork → rojo.
-  - Comentario de versión: el tag nombrado apunta a ese SHA. Terceros sin versión → rojo.
-  - Reusables propios (`FaroNovaCorp/*`): en la rama por defecto.
+  - Alcanzable desde una RAMA del dueño (por defecto, releases, resto; hasta 300 ramas en paralelo). Solo-tag o solo-fork → rojo. Búsqueda incompleta → rojo con ese motivo.
+  - Terceros: el tag del comentario apunta a ese SHA; `# vN` vale si algún `vN.x` apunta. Sin versión → rojo.
+  - Reusables propios (`FaroNovaCorp/*`): en la rama por defecto; comentario libre.
   - El par aparece literal en una línea añadida (corta escapes y alias).
-- zizmor 1.32.0 por archivo, `--no-config --no-ignores`, solo `impostor-commit` y `ref-version-mismatch`: en línea añadida → rojo; previo → aviso; zizmor no lee el archivo → aviso.
+- zizmor 1.32.0 por archivo, `--no-config --no-ignores`: `impostor-commit` en la línea de un par nuevo → rojo; `ref-version-mismatch`, pares previos o zizmor que no lee el archivo → aviso. La verificación propia es la autoridad.
 - Resumen en `GITHUB_STEP_SUMMARY` y anotaciones por línea.
 - Tests: casos con API simulada (impostor, solo-tag, comentario desfasado, escape YAML, archivo sin cambios relevantes).
 - PR propio en `.github` (`Va solo: seguridad`), revisión nivel 2, encolar.

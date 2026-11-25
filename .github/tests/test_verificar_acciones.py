@@ -9,6 +9,8 @@ Requiere PyYAML (lo mismo que extract_step_script.py).
 """
 
 import base64
+import hashlib
+import io
 import json
 import os
 import re
@@ -17,17 +19,33 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.error
+from contextlib import redirect_stdout
+from unittest import mock
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW = os.path.join(AQUI, "..", "workflows", "verificar-acciones.yml")
 
 LEGIT = "3d3c42e5aac5ba805825da76410c181273ba90b1"      # actions/checkout v7.0.1 (main)
-NUEVO = "1111111111111111111111111111111111111111"      # v7.0.2 (main)
+NUEVO = "1111111111111111111111111111111111111111"      # v7.0.2 (main); el flotante v7 apunta aquí
 IMPOSTOR = "70379aad1a8b40919ce8b382d3cd7d0315cde1d0"   # solo en un fork
 SOLO_TAG = "2222222222222222222222222222222222222222"   # v6.9.9 fuera de toda rama
 RELEASE = "3333333333333333333333333333333333333333"    # v6.0.0 en releases/v6
+LEJANO = "5555555555555555555555555555555555555555"     # v5.0.0 en la rama 45 (después de las primeras 40)
 PROPIO_OK = "69fd874d44e30b5b306843c14c8881373fa290a5"  # FaroNovaCorp/.github main
 PROPIO_FUERA = "4444444444444444444444444444444444444444"  # rama sin mergear
+
+# Salida real de zizmor 1.32.0 (--format json) sobre una línea con el impostor, recortada.
+ZIZMOR_JSON = json.dumps([
+    {"ident": "impostor-commit", "desc": "commit with no history in referenced repository",
+     "locations": [{"symbolic": {"kind": "Primary"},
+                    "concrete": {"location": {"start_point": {"row": 6, "column": 8},
+                                              "end_point": {"row": 6, "column": 70}}}}]},
+    {"ident": "artipacked", "desc": "credential persistence",
+     "locations": [{"symbolic": {"kind": "Primary"},
+                    "concrete": {"location": {"start_point": {"row": 6, "column": 8},
+                                              "end_point": {"row": 6, "column": 70}}}}]},
+])
 
 
 def cargar_script():
@@ -50,22 +68,51 @@ class FakeGH:
             "faronovacorp/.github": {"full_name": "FaroNovaCorp/.github", "default_branch": "main",
                                      "owner": {"login": "FaroNovaCorp"}},
         }
-        self.commits = {LEGIT, NUEVO, IMPOSTOR, SOLO_TAG, RELEASE, PROPIO_OK, PROPIO_FUERA}
-        self.ramas = {
-            "actions/checkout": {"main": {LEGIT, NUEVO}, "releases/v6": {RELEASE}},
-            "faronovacorp/.github": {"main": {PROPIO_OK}, "feat/x": {PROPIO_FUERA}},
-        }
+        self.commits = {LEGIT, NUEVO, IMPOSTOR, SOLO_TAG, RELEASE, LEJANO, PROPIO_OK, PROPIO_FUERA}
+        ramas = {"main": {LEGIT, NUEVO}, "releases/v6": {RELEASE}}
+        for i in range(60):
+            ramas[f"z-rama-{i:02d}"] = {LEJANO} if i == 45 else set()
+        self.ramas = {"actions/checkout": ramas,
+                      "faronovacorp/.github": {"main": {PROPIO_OK}, "feat/x": {PROPIO_FUERA}}}
         # tag → (tipo, sha); `tag` = anotado (objeto tag → commit)
         self.tags = {
             ("actions/checkout", "v7.0.1"): ("tag", "a" * 40),
             ("actions/checkout", "v7.0.2"): ("commit", NUEVO),
+            ("actions/checkout", "v7"): ("commit", NUEVO),
             ("actions/checkout", "v6.9.9"): ("commit", SOLO_TAG),
             ("actions/checkout", "v6.0.0"): ("commit", RELEASE),
+            ("actions/checkout", "v5.0.0"): ("commit", LEJANO),
         }
         self.tag_objs = {"a" * 40: LEGIT}
-        self.arboles = {}
+        self.arboles = {}   # sha → {nombre: entrada}
         self.blobs = {}
+        self.padres = {}
         self.llamadas = []
+
+    # -- árboles: se arman desde {ruta: (sha, modo)} con sha determinista por contenido
+    def arbol(self, archivos):
+        raiz = {}
+        for ruta, (sha, modo) in archivos.items():
+            nodo, partes = raiz, ruta.split("/")
+            for p in partes[:-1]:
+                nodo = nodo.setdefault(p, {})
+            nodo[partes[-1]] = (sha, modo)
+
+        def registrar(nodo):
+            entradas = {}
+            for nombre, v in sorted(nodo.items()):
+                if isinstance(v, dict):
+                    entradas[nombre] = {"path": nombre, "type": "tree", "mode": "040000",
+                                        "sha": registrar(v)}
+                else:
+                    sha, modo = v
+                    tipo = "commit" if modo == "160000" else "blob"
+                    entradas[nombre] = {"path": nombre, "type": tipo, "mode": modo, "sha": sha}
+            sha = hashlib.sha1(json.dumps(entradas, sort_keys=True).encode()).hexdigest()
+            self.arboles[sha] = entradas
+            return sha
+
+        return registrar(raiz)
 
     def api(self, ruta):
         self.llamadas.append(ruta)
@@ -77,8 +124,13 @@ class FakeGH:
         m = re.fullmatch(r"repos/([^/]+/[^/]+)/commits/([0-9a-f]{40})", ruta)
         if m:
             return (200, {"sha": m.group(2)}) if m.group(2) in self.commits else (422, None)
-        m = re.fullmatch(r"repos/([^/]+/[^/]+)/compare/(.+)\.\.\.([0-9a-f]{40})", ruta)
+        m = re.fullmatch(r"repos/([^/]+/[^/]+)/git/commits/(\w+)", ruta)
         if m:
+            return 200, {"parents": [{"sha": p} for p in self.padres[m.group(2)]]}
+        m = re.fullmatch(r"repos/([^/]+/[^/]+)/compare/(.+)\.\.\.(\w+)", ruta)
+        if m:
+            if m.group(1).lower() == "faronovacorp/x":
+                return 200, {"merge_base_commit": {"sha": "mb"}}
             en = self.ramas.get(m.group(1).lower(), {}).get(m.group(2), set())
             return 200, {"status": "behind" if m.group(3) in en else "diverged"}
         m = re.fullmatch(r"repos/([^/]+/[^/]+)/git/ref/tags/(.+)", ruta)
@@ -90,9 +142,7 @@ class FakeGH:
             return 200, {"object": {"type": "commit", "sha": self.tag_objs[m.group(2)]}}
         m = re.fullmatch(r"repos/([^/]+/[^/]+)/git/trees/(\w+)", ruta)
         if m:
-            arbol = self.arboles[m.group(2)]
-            return 200, {"truncated": False, "tree": [
-                {"path": p, "type": "blob", "sha": s} for p, s in arbol.items()]}
+            return 200, {"truncated": False, "tree": list(self.arboles[m.group(2)].values())}
         m = re.fullmatch(r"repos/([^/]+/[^/]+)/git/blobs/(\w+)", ruta)
         if m:
             return 200, {"content": base64.b64encode(self.blobs[m.group(2)].encode()).decode()}
@@ -100,9 +150,18 @@ class FakeGH:
 
     def api_paginado(self, ruta, tope=1000):
         m = re.fullmatch(r"repos/([^/]+/[^/]+)/branches\?per_page=100", ruta)
-        assert m, ruta
-        ramas = self.ramas.get(m.group(1).lower(), {})
-        return [{"name": n, "commit": {"sha": "f" * 40}} for n in ramas]
+        if m:
+            ramas = self.ramas.get(m.group(1).lower(), {})
+            return [{"name": n, "commit": {"sha": "f" * 40}} for n in ramas]
+        m = re.fullmatch(r"repos/([^/]+/[^/]+)/tags\?per_page=100", ruta)
+        if m:
+            return [{"name": t, "commit": {"sha": self.tag_commit_pelado(r, t)}}
+                    for (r, t) in self.tags if r == m.group(1).lower()]
+        raise AssertionError(ruta)
+
+    def tag_commit_pelado(self, repo, tag):
+        tipo, sha = self.tags[(repo, tag)]
+        return self.tag_objs[sha] if tipo == "tag" else sha
 
 
 BASE = """name: ci
@@ -116,8 +175,12 @@ jobs:
 """
 
 
+def base_wf():
+    return BASE.replace("{LEGIT}", LEGIT)
+
+
 def wf(paso):
-    return BASE.replace("{LEGIT}", LEGIT).replace("      - run: echo hola\n", paso + "      - run: echo hola\n")
+    return base_wf().replace("      - run: echo hola\n", paso + "      - run: echo hola\n")
 
 
 class Base(unittest.TestCase):
@@ -131,8 +194,9 @@ class Base(unittest.TestCase):
         self.m.api_paginado = self.gh.api_paginado
 
     def revisar(self, head, base=None):
-        base = BASE.replace("{LEGIT}", LEGIT) if base is None else base
-        return self.m.revisar_archivo(".github/workflows/ci.yml", base, head, self.m.Verificador())
+        base = base_wf() if base is None else base
+        hall, _ = self.m.revisar_archivo(".github/workflows/ci.yml", base, head, self.m.Verificador())
+        return hall
 
     def errores(self, hallazgos):
         return [h for h in hallazgos if h["nivel"] == "error"]
@@ -159,11 +223,34 @@ class TestVerificacionPropia(Base):
         head = BASE.replace("{LEGIT}", RELEASE).replace("v7.0.1", "v6.0.0")
         self.assertEqual(self.revisar(head), [])
 
+    def test_commit_en_rama_mas_alla_de_las_primeras_40_pasa(self):
+        head = BASE.replace("{LEGIT}", LEJANO).replace("v7.0.1", "v5.0.0")
+        self.assertEqual(self.revisar(head), [])
+
+    def test_busqueda_incompleta_lo_dice(self):
+        self.m.MAX_RAMAS = 10
+        try:
+            head = BASE.replace("{LEGIT}", IMPOSTOR).replace("v7.0.1", "v6.0.2")
+            errs = self.errores(self.revisar(head))
+        finally:
+            self.m.MAX_RAMAS = 300
+        self.assertTrue(any("búsqueda incompleta" in e["motivo"] for e in errs), errs)
+
     def test_comentario_desfasado_bloquea(self):
         head = BASE.replace("{LEGIT}", NUEVO)  # comentario sigue diciendo v7.0.1
         errs = self.errores(self.revisar(head))
         self.assertEqual(len(errs), 1, errs)
         self.assertIn("v7.0.1 apunta a", errs[0]["motivo"])
+
+    def test_mayor_flotante_movido_pasa_si_un_vN_x_apunta(self):
+        # v7 ya apunta a NUEVO, pero LEGIT es v7.0.1: `# v7` sigue siendo cierto.
+        head = wf(f"      - uses: actions/checkout@{LEGIT} # v7\n")
+        self.assertEqual(self.revisar(head, base=""), [])
+
+    def test_mayor_de_otra_familia_bloquea(self):
+        head = wf(f"      - uses: actions/checkout@{LEGIT} # v6\n")
+        errs = self.errores(self.revisar(head, base=""))
+        self.assertTrue(any("v6" in e["motivo"] for e in errs), errs)
 
     def test_tag_inexistente_bloquea(self):
         head = BASE.replace("{LEGIT}", NUEVO).replace("v7.0.1", "v9.9.9")
@@ -194,15 +281,15 @@ class TestVerificacionPropia(Base):
         errs = self.errores(self.revisar(head))
         self.assertTrue(any("no se pudo leer el repo" in e["motivo"] for e in errs), errs)
 
-    def test_reusable_propio_en_main_pasa_sin_version(self):
-        head = BASE.replace("{LEGIT}", LEGIT) + (
-            "  b:\n"
-            f"    uses: FaroNovaCorp/.github/.github/workflows/secret-scan.yml@{PROPIO_OK}"
-            " # re-pin P-144 (D-1275/D-1287, PR .github#19)\n")
-        self.assertEqual(self.revisar(head), [])
+    def test_reusable_propio_en_main_pasa_con_comentario_libre(self):
+        for nota in (" # re-pin P-144 (D-1275/D-1287, PR .github#19)", " # pin tras P-385 (ruleset 2.1)", ""):
+            head = base_wf() + (
+                "  b:\n"
+                f"    uses: FaroNovaCorp/.github/.github/workflows/secret-scan.yml@{PROPIO_OK}{nota}\n")
+            self.assertEqual(self.revisar(head), [], nota)
 
     def test_reusable_propio_sin_mergear_bloquea(self):
-        head = BASE.replace("{LEGIT}", LEGIT) + (
+        head = base_wf() + (
             "  b:\n"
             f"    uses: FaroNovaCorp/.github/.github/workflows/secret-scan.yml@{PROPIO_FUERA}\n")
         errs = self.errores(self.revisar(head))
@@ -214,8 +301,14 @@ class TestVerificacionPropia(Base):
         errs = self.errores(self.revisar(head))
         self.assertTrue(any("no aparece literal" in e["motivo"] for e in errs), errs)
 
+    def test_clave_duplicada_bloquea(self):
+        head = wf(f"      - uses: actions/checkout@{IMPOSTOR} # v7.0.1\n"
+                  f"        uses: actions/checkout@{NUEVO} # v7.0.2\n")
+        errs = self.errores(self.revisar(head))
+        self.assertTrue(any("duplicada" in e["motivo"] for e in errs), errs)
+
     def test_alias_yaml_con_ancla_en_linea_nueva_se_verifica(self):
-        head = BASE.replace("{LEGIT}", LEGIT) + (
+        head = base_wf() + (
             "  b:\n    runs-on: ubuntu-latest\n    steps:\n"
             f"      - uses: &co actions/checkout@{IMPOSTOR} # v7.0.1\n"
             "      - uses: *co\n")
@@ -231,6 +324,7 @@ class TestVerificacionPropia(Base):
 
     def test_locales_y_docker(self):
         head = wf("      - uses: ./.github/actions/x\n"
+                  "      - uses: $/.github/actions/y\n"
                   "      - uses: docker://alpine@sha256:" + "0" * 64 + "\n"
                   "      - uses: docker://alpine:3\n")
         hall = self.revisar(head)
@@ -247,6 +341,38 @@ class TestVerificacionPropia(Base):
                   f"      - uses: actions/checkout@{NUEVO} # v7.0.2\n")
         self.assertEqual(self.revisar(head), [])
         self.assertEqual(sum(r.startswith("repos/actions/checkout/compare") for r in self.gh.llamadas), 1)
+
+
+class TestDetectar(Base):
+    def test_diff_incremental_y_archivos_relevantes(self):
+        b = self.gh.arbol({".github/workflows/ci.yml": ("x1", "100644"), "README.md": ("r1", "100644"),
+                           "action.yml": ("a1", "100644"), "src/mod/a.py": ("p1", "100644")})
+        h = self.gh.arbol({".github/workflows/ci.yml": ("x2", "100644"), "README.md": ("r2", "100644"),
+                           "action.yml": ("a1", "100644"), "src/mod/a.py": ("p1", "100644"),
+                           ".github/workflows/nuevo.yml": ("n1", "100644"),
+                           "sub/dir/action.yaml": ("s1", "100644")})
+        self.gh.llamadas.clear()
+        cambios, prohibidos = self.m.detectar("FaroNovaCorp/x", b, h)
+        self.assertEqual(cambios, [
+            {"ruta": ".github/workflows/ci.yml", "base": "x1", "head": "x2"},
+            {"ruta": ".github/workflows/nuevo.yml", "base": None, "head": "n1"},
+            {"ruta": "sub/dir/action.yaml", "base": None, "head": "s1"},
+        ])
+        self.assertEqual(prohibidos, [])
+        # `src/` no cambió: no se baja a ese subárbol.
+        arboles_src = [r for r in self.gh.llamadas if "git/trees" in r]
+        self.assertLessEqual(len(arboles_src), 8)
+
+    def test_enlace_simbolico_y_submodulo_prohibidos(self):
+        b = self.gh.arbol({"README.md": ("r1", "100644")})
+        h = self.gh.arbol({"README.md": ("r1", "100644"),
+                           "local/action.yml": ("../payload/manifest.yml", "120000"),
+                           ".github/actions/x": ("../../vendor/x", "120000"),
+                           ".github/vendor": ("c" * 40, "160000"),
+                           "docs/enlace.md": ("../README.md", "120000")})
+        cambios, prohibidos = self.m.detectar("FaroNovaCorp/x", b, h)
+        self.assertEqual(cambios, [])
+        self.assertEqual([r for r, _ in prohibidos], [".github/actions/x", ".github/vendor", "local/action.yml"])
 
 
 class TestPiezas(Base):
@@ -275,41 +401,96 @@ class TestPiezas(Base):
         self.assertEqual(self.m.comentario(f"  - uses: {u}", u), "")
         self.assertFalse(self.m.aparece(u, f"  - uses: evil-{u} # v7.0.1"))
 
-    def test_detectar(self):
-        self.gh.arboles = {
-            "b": {".github/workflows/ci.yml": "x1", "README.md": "r1", "action.yml": "a1"},
-            "h": {".github/workflows/ci.yml": "x2", "README.md": "r2", "action.yml": "a1",
-                  ".github/workflows/nuevo.yml": "n1"},
-        }
-        cambios = self.m.detectar("FaroNovaCorp/x", "b", "h")
-        self.assertEqual(cambios, [
-            {"ruta": ".github/workflows/ci.yml", "base": "x1", "head": "x2"},
-            {"ruta": ".github/workflows/nuevo.yml", "base": None, "head": "n1"},
-        ])
-
-    def test_zizmor_solo_bloquea_lineas_nuevas(self):
-        base = BASE.replace("{LEGIT}", LEGIT)
-        head = base.replace("echo hola", "echo chao")
+    def test_zizmor_bloquea_solo_impostor_en_par_nuevo(self):
         self.m.correr_zizmor = lambda archivo: [
-            ("ref-version-mismatch", 7, 7, "desfase previo"), ("impostor-commit", 8, 8, "nuevo")]
+            ("ref-version-mismatch", 7, 7, "desfase"), ("impostor-commit", 7, 7, "impostor"),
+            ("impostor-commit", 9, 9, "previo")]
         with tempfile.TemporaryDirectory() as d:
-            hall = self.m.revisar_zizmor(".github/workflows/ci.yml", base, head, d)
-        self.assertEqual([h["nivel"] for h in hall], ["aviso", "error"])
-        self.m.correr_zizmor = lambda archivo: None
+            hall = self.m.revisar_zizmor(".github/workflows/ci.yml", base_wf(), d, {7})
+        self.assertEqual([h["nivel"] for h in hall], ["aviso", "error", "aviso"])
+
+    def test_zizmor_par_previo_con_comentario_editado_avisa(self):
+        base = BASE.replace("{LEGIT}", NUEVO)          # desfase previo en la línea 7
+        head = base.replace("# v7.0.1", "# v7.0.1  (bump pendiente)")
+        hall, de_pares_nuevos = self.m.revisar_archivo(".github/workflows/ci.yml", base, head,
+                                                       self.m.Verificador())
+        self.assertEqual((hall, de_pares_nuevos), ([], set()))
+        self.m.correr_zizmor = lambda archivo: [("impostor-commit", 7, 7, "x")]
         with tempfile.TemporaryDirectory() as d:
-            hall = self.m.revisar_zizmor(".github/workflows/ci.yml", base, head, d)
+            hall = self.m.revisar_zizmor(".github/workflows/ci.yml", head, d, de_pares_nuevos)
         self.assertEqual(hall[0]["nivel"], "aviso")
 
-    def test_informar_escapa_comandos(self, ):
-        hall = [self.m.hallazgo("error", "a,b:c.yml", 3, "x/y@z\n::stop-commands::t", "malo\nmás")]
+    def test_zizmor_que_falla_avisa(self):
+        self.m.correr_zizmor = lambda archivo: None
         with tempfile.TemporaryDirectory() as d:
-            os.environ["GITHUB_STEP_SUMMARY"] = os.path.join(d, "s.md")
-            from io import StringIO
-            from contextlib import redirect_stdout
-            buf = StringIO()
-            with redirect_stdout(buf):
-                n = self.m.informar(hall, [{}])
-            del os.environ["GITHUB_STEP_SUMMARY"]
+            hall = self.m.revisar_zizmor(".github/workflows/ci.yml", base_wf(), d, {7})
+        self.assertEqual(hall[0]["nivel"], "aviso")
+
+    def test_correr_zizmor_lee_json_real_y_tolera_timeout(self):
+        mod = cargar_script()  # correr_zizmor sin parchear
+        ok = subprocess.CompletedProcess([], 0, stdout=ZIZMOR_JSON, stderr="")
+        with mock.patch.object(mod.subprocess, "run", return_value=ok):
+            self.assertEqual(mod.correr_zizmor("x.yml"),
+                             [("impostor-commit", 7, 7, "commit with no history in referenced repository")])
+        with mock.patch.object(mod.subprocess, "run", side_effect=subprocess.TimeoutExpired("z", 120)):
+            self.assertIsNone(mod.correr_zizmor("x.yml"))
+        roto = subprocess.CompletedProcess([], 1, stdout="", stderr="fatal")
+        with mock.patch.object(mod.subprocess, "run", return_value=roto):
+            self.assertIsNone(mod.correr_zizmor("x.yml"))
+
+    def test_pedir_reintenta_errores_de_red_y_pagina(self):
+        mod = cargar_script()
+
+        class Resp(io.BytesIO):
+            def __init__(self, cuerpo, link=None):
+                super().__init__(cuerpo)
+                self.status = 200
+                self.headers = {"Link": link} if link else {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        pagina2 = f'<{mod.API}/repos/a/b/branches?page=2>; rel="next"'
+        respuestas = [ConnectionResetError("reset"), Resp(b'[{"name": "uno"}]', pagina2),
+                      Resp(b'[{"name": "dos"}]')]
+
+        def urlopen(req, timeout):
+            r = respuestas.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "fake"}), \
+                mock.patch.object(mod.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(mod.time, "sleep", lambda s: None):
+            self.assertEqual([r["name"] for r in mod.api_paginado("repos/a/b/branches?per_page=100")],
+                             ["uno", "dos"])
+
+    def test_pedir_404_y_limite_agotado(self):
+        mod = cargar_script()
+
+        def error(code, cab):
+            def urlopen(req, timeout):
+                raise urllib.error.HTTPError(req.full_url, code, "x", cab, io.BytesIO(b""))
+            return urlopen
+
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "fake"}):
+            with mock.patch.object(mod.urllib.request, "urlopen", error(404, {})):
+                self.assertEqual(mod.api("repos/a/b"), (404, None))
+            with mock.patch.object(mod.urllib.request, "urlopen", error(403, {"X-RateLimit-Remaining": "0"})):
+                with self.assertRaises(mod.ErrorApi):
+                    mod.api("repos/a/b")
+
+    def test_informar_escapa_comandos(self):
+        hall = [self.m.hallazgo("error", "a,b:c.yml", 3, "x/y@z\n::stop-commands::t", "malo\nmás")]
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": os.path.join(d, "s.md")}), \
+                redirect_stdout(buf):
+            n = self.m.informar(hall, 1)
         self.assertEqual(n, 1)
         salida = buf.getvalue().splitlines()
         self.assertTrue(salida[0].startswith("::error file=a%2Cb%3Ac.yml,line=3,"), salida[0])
@@ -317,11 +498,16 @@ class TestPiezas(Base):
 
 
 class TestMain(Base):
-    def correr(self, evento, nombre, cambios_en_head):
-        self.gh.arboles = {"b": {".github/workflows/ci.yml": "x1"},
-                           "h": {".github/workflows/ci.yml": "x2" if cambios_en_head else "x1"}}
-        self.gh.blobs = {"x1": BASE.replace("{LEGIT}", LEGIT),
-                         "x2": BASE.replace("{LEGIT}", IMPOSTOR)}
+    """Evento completo: árboles, merge de prueba, instalación y zizmor simulados."""
+
+    def correr(self, evento, nombre, base_arch, head_arch, padres=("B", "PRHEAD")):
+        b = self.gh.arbol(base_arch)
+        h = self.gh.arbol(head_arch)
+        self.gh.padres = {"MERGE": [b if p == "B" else p for p in padres]}
+        self.gh.arboles["MERGE"] = self.gh.arboles[h]
+        self.gh.arboles["B"] = self.gh.arboles[b]
+        self.gh.blobs = {"x1": base_wf(), "x2": BASE.replace("{LEGIT}", IMPOSTOR),
+                         "x3": BASE.replace("{LEGIT}", NUEVO).replace("v7.0.1", "v7.0.2")}
         instalado = []
         self.m.instalar = lambda: instalado.append(True)
         self.m.correr_zizmor = lambda archivo: []
@@ -329,30 +515,50 @@ class TestMain(Base):
             ruta = os.path.join(d, "ev.json")
             with open(ruta, "w") as f:
                 json.dump(evento, f)
-            os.environ.update({"GITHUB_EVENT_PATH": ruta, "GITHUB_EVENT_NAME": nombre,
-                               "GITHUB_REPOSITORY": "FaroNovaCorp/x"})
-            from io import StringIO
-            from contextlib import redirect_stdout
-            with redirect_stdout(StringIO()):
+            env = {"GITHUB_EVENT_PATH": ruta, "GITHUB_EVENT_NAME": nombre,
+                   "GITHUB_REPOSITORY": "FaroNovaCorp/x", "GITHUB_SHA": "MERGE"}
+            with mock.patch.dict(os.environ, env), redirect_stdout(io.StringIO()):
                 rc = self.m.main()
         return rc, instalado
 
+    PR = {"pull_request": {"base": {"sha": "B"}, "head": {"sha": "PRHEAD"}}}
+
     def test_pr_sin_cambios_relevantes_no_instala(self):
-        rc, inst = self.correr({"pull_request": {"base": {"sha": "b"}, "head": {"sha": "h"}}},
-                               "pull_request", False)
+        arch = {".github/workflows/ci.yml": ("x1", "100644"), "src/a.py": ("p1", "100644")}
+        rc, inst = self.correr(self.PR, "pull_request", arch,
+                               {**arch, "src/a.py": ("p2", "100644")})
+        self.assertEqual((rc, inst), (0, []))
+
+    def test_pr_atrasado_no_hereda_cambios_de_main(self):
+        # main subió el workflow a x3; el merge de prueba ya trae x3: sin cambio relevante.
+        main_arch = {".github/workflows/ci.yml": ("x3", "100644"), "src/a.py": ("p1", "100644")}
+        merge_arch = {".github/workflows/ci.yml": ("x3", "100644"), "src/a.py": ("p2", "100644")}
+        rc, inst = self.correr(self.PR, "pull_request", main_arch, merge_arch)
         self.assertEqual((rc, inst), (0, []))
 
     def test_pr_con_impostor_falla(self):
-        rc, inst = self.correr({"pull_request": {"base": {"sha": "b"}, "head": {"sha": "h"}}},
-                               "pull_request", True)
+        rc, inst = self.correr(self.PR, "pull_request", {".github/workflows/ci.yml": ("x1", "100644")},
+                               {".github/workflows/ci.yml": ("x2", "100644")})
         self.assertEqual((rc, inst), (1, [True]))
 
+    def test_pr_con_bump_legitimo_pasa(self):
+        rc, inst = self.correr(self.PR, "pull_request", {".github/workflows/ci.yml": ("x1", "100644")},
+                               {".github/workflows/ci.yml": ("x3", "100644")})
+        self.assertEqual((rc, inst), (0, [True]))
+
+    def test_pr_con_enlace_simbolico_falla_sin_instalar(self):
+        rc, inst = self.correr(self.PR, "pull_request", {"README.md": ("r1", "100644")},
+                               {"README.md": ("r1", "100644"), "a/action.yml": ("../m.yml", "120000")})
+        self.assertEqual((rc, inst), (1, []))
+
     def test_cola_con_impostor_falla(self):
-        rc, _ = self.correr({"merge_group": {"base_sha": "b", "head_sha": "h"}}, "merge_group", True)
+        ev = {"merge_group": {"base_sha": "B", "head_sha": "MERGE"}}
+        rc, _ = self.correr(ev, "merge_group", {".github/workflows/ci.yml": ("x1", "100644")},
+                            {".github/workflows/ci.yml": ("x2", "100644")})
         self.assertEqual(rc, 1)
 
     def test_evento_no_soportado_falla(self):
-        rc, _ = self.correr({}, "push", True)
+        rc, _ = self.correr({}, "push", {"a": ("1", "100644")}, {"a": ("1", "100644")})
         self.assertEqual(rc, 1)
 
 
