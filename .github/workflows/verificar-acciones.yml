@@ -358,7 +358,7 @@ jobs:
                       out.add(("(inputs repetidos)", ""))
                       continue
                   servidor = entradas_.get("github-server-url", "")
-                  if servidor and servidor.rstrip("/") not in ("https://github.com", "${{ github.server_url }}"):
+                  if servidor and not re.fullmatch(r"https://github\.com/?|\$\{\{\s*github\.server_url\s*\}\}", servidor):
                       out.add((f"(servidor {servidor})", ""))
                       continue
                   repo_, ref = entradas_.get("repository", ""), entradas_.get("ref", "")
@@ -367,8 +367,9 @@ jobs:
               return out
 
 
-          # Expresión que solo lee contextos, unidos por `||` (sin constantes):
-          # `${{ github.event.inputs.ref || github.sha }}`, `${{ steps.plan.outputs.sha }}`.
+          # Expresión que solo lee contextos, unidos por `||` (sin constantes), p. ej.
+          # github.event.inputs.ref || github.sha, o steps.plan.outputs.sha.
+          # Ojo: ningún `$` seguido de `{{` literal en este script: GitHub lo evaluaría.
           CTX = r"(?:github|inputs|steps|needs|matrix|env|vars)\.[A-Za-z0-9_.-]+"
           REF_CALCULADA = re.compile(r"\$\{\{\s*" + CTX + r"(?:\s*\|\|\s*" + CTX + r")*\s*\}\}")
           RAMA_DEFECTO = ("", "main", "refs/heads/main")

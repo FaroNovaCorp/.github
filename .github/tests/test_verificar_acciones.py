@@ -493,6 +493,14 @@ class TestDetectar(Base):
 
 
 class TestPiezas(Base):
+    def test_script_sin_expresiones_de_github(self):
+        # GitHub evalúa todo `${{ … }}` dentro de `run:` antes de correrlo: el
+        # 25-nov una en un comentario invalidó el workflow entero.
+        codigo = subprocess.run(
+            [sys.executable, os.path.join(AQUI, "extract_step_script.py"), WORKFLOW,
+             "verificar", "Verificar acciones"], check=True, capture_output=True, text=True).stdout
+        self.assertNotIn("${{", codigo)
+
     def test_es_relevante(self):
         si = [".github/workflows/ci.yml", ".github/workflows/x.yaml", "action.yml",
               ".github/actions/a/action.yaml", "sub/dir/action.yml"]
