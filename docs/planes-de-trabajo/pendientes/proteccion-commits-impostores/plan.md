@@ -88,7 +88,7 @@ Secundarios:
 - Diff de árboles incremental por API (solo directorios que cambiaron; sin el tope de 7 MB del árbol recursivo). Relevantes: `.github/workflows/*.yml|yaml` de primer nivel (los únicos que GitHub carga) y `action.yml|action.yaml` en cualquier ruta. Sin relevantes → verde sin instalar nada.
 - Enlace simbólico bajo `.github/` o como `action.yml` → rojo. Submódulo o `.gitmodules` nuevo, en cualquier ruta → rojo. Puntero de Git LFS o raíz que no es mapa → rojo (hoy: 0 de cada uno en la org).
 - YAML como árbol de nodos sin construir (PyYAML `compose`, venv, `--require-hashes`): etiquetas como `!!omap` no esconden nada, igual que en el runner. Claves duplicadas → rojo.
-- `uses: ./p` bajo un checkout de otro repo (`repository:`): `ref:` debe ser un SHA alcanzable.
+- Todo `actions/checkout` nuevo que elige otro árbol (`repository:`/`ref:`, inputs sin mayúsculas ni espacios, como el runner): SHA literal → alcanzable; repo de la org en `main`; propio repo con rama o expresión. Otro repo sin SHA → rojo. Clave `<<` → rojo.
 - Pares nuevos = `uses` de head que no estaban en la base. Por cada uno:
   - SHA completo de 40.
   - Commit existe en el repo dueño.

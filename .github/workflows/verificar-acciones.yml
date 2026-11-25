@@ -58,8 +58,11 @@ jobs:
             alias y multilínea que esconden el valor real). YAML leído como
             árbol de nodos, sin etiquetas (como el runner). Claves duplicadas
             → rojo.
-          - `uses: ./p` bajo un checkout de OTRO repo (`repository:`) en la misma
-            lista de pasos: `ref:` debe ser un SHA alcanzable; si no → rojo.
+          - Todo `actions/checkout` nuevo que elige otro árbol (`repository:` o
+            `ref:`) se verifica, porque un `uses: ./…` posterior correría su
+            action.yml: SHA literal → alcanzable · repo de la org en `main` ·
+            propio repo con rama o expresión. Otro repo sin SHA → rojo. Clave
+            `<<` → rojo.
           - Enlace simbólico bajo `.github/` o como action.yml → rojo. Submódulo o
             `.gitmodules` nuevo o modificado, en cualquier ruta → rojo.
           - zizmor (--no-config --no-ignores): impostor-commit en la línea de un
@@ -284,10 +287,13 @@ jobs:
                   if isinstance(n, yaml.MappingNode):
                       vistas = set()
                       for k, _v in n.value:
-                          if isinstance(k, yaml.ScalarNode) and k.value != "<<":
-                              if k.value in vistas:
-                                  return None, f"clave duplicada {k.value!r}", k.start_mark.line + 1
-                              vistas.add(k.value)
+                          if not isinstance(k, yaml.ScalarNode):
+                              continue
+                          if k.value == "<<":
+                              return None, "clave de fusión `<<`: no se permite (esconde pasos)", k.start_mark.line + 1
+                          if k.value in vistas:
+                              return None, f"clave duplicada {k.value!r}", k.start_mark.line + 1
+                          vistas.add(k.value)
               return raiz, None, None
 
 
@@ -327,37 +333,60 @@ jobs:
                       for k, v in n.value if escalar(k) == "uses"]
 
 
-          def checkouts_locales(raiz):
-              """{(repositorio, ref, uso)}: `uses: ./p` bajo el path de un checkout de otro repo.
+          def checkouts(raiz):
+              """{(repositorio, ref)} de todo `actions/checkout` que elige otro árbol.
 
-              `actions/checkout` con `repository:` + `uses: ./…` en la misma lista de
-              pasos ejecuta un action.yml de ese repo y ref, fuera de toda clave `uses`.
+              Un checkout de otro repo o ref seguido de `uses: ./…` (en el mismo paso
+              de lista, en otra acción compuesta o con un path en expresión) ejecuta
+              un action.yml fuera de toda clave `uses`. Se verifica el checkout mismo,
+              dondequiera que esté. Inputs como el runner: nombre sin mayúsculas,
+              valor recortado; nombres repetidos → no verificable.
               """
-              import yaml
               out = set()
               for n in nodos(raiz):
-                  pasos = campos(n).get("steps")
-                  if not isinstance(pasos, yaml.SequenceNode):
+                  c = campos(n)
+                  if (escalar(c.get("uses")) or "").strip().split("@")[0].lower() != "actions/checkout":
                       continue
-                  pasos = [campos(p) for p in pasos.value]
-                  ajenos = []
-                  for p in pasos:
-                      if (escalar(p.get("uses")) or "").split("@")[0].lower() != "actions/checkout":
-                          continue
-                      w = campos(p.get("with"))
-                      repo_ = (escalar(w.get("repository")) or "").strip()
-                      if repo_:
-                          ajenos.append((repo_, (escalar(w.get("ref")) or "").strip(),
-                                         os.path.normpath(escalar(w.get("path")) or ".")))
-                  for p in pasos:
-                      u = escalar(p.get("uses")) or ""
-                      if not u.startswith("./"):
-                          continue
-                      local = os.path.normpath(u)
-                      for repo_, ref, ruta in ajenos:
-                          if ruta == "." or local == ruta or local.startswith(ruta + "/"):
-                              out.add((repo_, ref, u))
+                  w = campos(c.get("with"))
+                  entradas_ = {k.lower(): (escalar(v) or "").strip() for k, v in w.items()}
+                  if len(entradas_) != len(w):
+                      out.add(("(inputs repetidos)", ""))
+                      continue
+                  repo_, ref = entradas_.get("repository", ""), entradas_.get("ref", "")
+                  if repo_ or ref:
+                      out.add((repo_, ref))
               return out
+
+
+          def verificar_checkout(repo_, ref, verif):
+              """Motivo de rojo, o None.
+
+              - Propio repo: un SHA literal debe ser alcanzable (un commit de un fork
+                del propio repo también resuelve). Ramas y expresiones (`inputs.ref`,
+                `steps.*.outputs`) eligen código del propio repo o se calculan en
+                ejecución: lo mismo que un `run:`, fuera de este check.
+              - Repo de la org: `main` (o sin ref); un SHA literal, alcanzable.
+              - Otro repo: nombre literal y SHA alcanzable. Lo demás → rojo.
+              """
+              propio = os.environ.get("GITHUB_REPOSITORY", "")
+              r = re.sub(r"\$\{\{\s*github\.repository_owner\s*\}\}", propio.split("/")[0], repo_)
+              if re.fullmatch(r"\$\{\{\s*github\.repository\s*\}\}", r):
+                  r = propio
+              literal = re.fullmatch(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)", r)
+              if not r or r.lower() == propio.lower():
+                  if SHA_RE.fullmatch(ref) and propio:
+                      return verif.alcanzable(*propio.split("/", 1), ref)
+                  return None
+              dueno = r.split("/", 1)[0]
+              if SHA_RE.fullmatch(ref):
+                  if not literal:
+                      return f"checkout de `{repo_}` con SHA: repositorio no verificable; escríbelo literal"
+                  return verif.alcanzable(literal.group(1), literal.group(2), ref)
+              if dueno.lower() == ORG and ref in ("", "main", "refs/heads/main"):
+                  return None
+              if not literal:
+                  return f"checkout de `{repo_}`: repositorio no verificable; escríbelo literal"
+              return f"checkout de {r} sin SHA fijo (`ref: {ref or 'por defecto'}`): fija `ref:` a un SHA completo"
 
 
           def _buscar(uso, linea):
@@ -529,20 +558,13 @@ jobs:
               lineas = head_txt.splitlines()
               nuevas = sorted(lineas_nuevas(base_txt, head_txt))
               out, vistos, de_pares_nuevos = [], set(), set()
-              propio = os.environ.get("GITHUB_REPOSITORY", "").lower()
-              for repo_, ref, uso in sorted(checkouts_locales(raiz) - checkouts_locales(raiz_base)):
-                  if repo_.lower() == propio:
-                      continue
-                  n = next((i for i, l in enumerate(lineas, 1) if aparece(uso, l)), None)
-                  m = re.fullmatch(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)", repo_)
-                  if m and SHA_RE.fullmatch(ref):
-                      motivo = verif.alcanzable(m.group(1), m.group(2), ref)
-                      if motivo:
-                          out.append(hallazgo("error", ruta, n, uso, f"acción local desde un checkout de {repo_}: {motivo}"))
-                  else:
-                      out.append(hallazgo("error", ruta, n, uso,
-                                          f"acción local desde un checkout de {repo_} sin SHA fijo "
-                                          f"(ref: {ref or 'por defecto'}): fija `ref:` a un SHA completo"))
+              for repo_, ref in sorted(checkouts(raiz) - checkouts(raiz_base)):
+                  motivo = verificar_checkout(repo_, ref, verif)
+                  if motivo:
+                      clave = ref or repo_
+                      n = next((i for i in nuevas if clave and clave in lineas[i - 1]), None)
+                      out.append(hallazgo("error", ruta, n, f"actions/checkout · {repo_ or 'propio'}@{ref or '-'}",
+                                          motivo))
               for uso in usos(raiz):
                   if not isinstance(uso, str):
                       out.append(hallazgo("error", ruta, None, None, "`uses` que no es texto"))

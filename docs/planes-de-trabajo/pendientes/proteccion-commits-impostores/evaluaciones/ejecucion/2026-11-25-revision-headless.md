@@ -38,7 +38,25 @@
 | `pull_request_target` aceptado | Claude | 6 | evento no soportado |
 | Límite secundario de la API | Claude | 6 | reintento con espera |
 
-## Ronda 3 (7560de3)
+## Ronda 3 (7560de3) — ambos CAMBIOS REQUERIDOS
+
+| Hallazgo | Revisor | F×G | Fix (4ad1443) |
+|---|---|---|---|
+| Etiquetas YAML (`!!omap`, `!!set`, `!!pairs`) esconden un `uses` | Codex | 27 | árbol de nodos con `compose`, sin etiquetas |
+| Checkout de otro repo + `uses: ./…` corre un action.yml no verificado | Claude | 16 | regla de checkout (rehecha en ronda 4) |
+
+## Ronda 4 (4ad1443) — ambos CAMBIOS REQUERIDOS
+
+| Hallazgo | Revisor | F×G | Fix |
+|---|---|---|---|
+| Regla de checkout evadible: mayúsculas en inputs, espacios, path en expresión | Codex | 27 | inputs como el runner; se verifica el checkout, no el path |
+| Propio repo con `ref:` a un commit de fork | ambos | 18 / 14 | SHA literal del propio repo → alcanzable |
+| Checkout en una acción compuesta y consumo en el workflow | ambos | 18 / 14 | todo checkout nuevo con `repository`/`ref`, dondequiera |
+| Clave de fusión `<<` | Claude | 14 | rojo |
+
+Ensayo en seco tras el fix: 8 falsos rojos en patrones reales (despliegue por `inputs.ref`, robot de migraciones, propagación por matriz) → regla ajustada → 0 sobre los 94 archivos de la org.
+
+## Ronda 5
 
 PENDIENTE
 
@@ -47,5 +65,10 @@ PENDIENTE
 - Relevantes: `.github/workflows/*.y*ml` de primer nivel y `action.y*ml` (los únicos que GitHub carga), no todo YAML bajo `.github/`.
 - zizmor `ref-version-mismatch` avisa; la verificación propia de versión es la que bloquea.
 
+## Límites aceptados (fuera de F1)
+- Código arbitrario en `run:` (incluye refs calculadas en ejecución): revisión del PR y `/cambios-criticos`.
+- Ejecución del impostor en el CI del propio PR, antes del merge: F5 (lockfiles).
+- Cualquier `dueño/repo@sha` en una rama de su dueño pasa: no hay lista de dueños permitidos.
+
 ## Para tarea
-- `cargar_yaml` con YAML 1.1: `on`/`true` o `1`/`01` como claves del mismo mapa cuentan como duplicadas (no ocurre en workflows reales). F×G 2.
+- Ninguno.

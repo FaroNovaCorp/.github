@@ -325,32 +325,73 @@ class TestVerificacionPropia(Base):
         errs = self.errores(self.revisar(head))
         self.assertTrue(any("duplicada" in e["motivo"] for e in errs), errs)
 
-    def test_checkout_de_otro_repo_mas_uses_local(self):
-        def paso(ref, repo="actions/checkout", ruta="x"):
-            return (f"      - uses: actions/checkout@{LEGIT} # v7.0.1\n"
-                    f"        with:\n          repository: {repo}\n"
-                    + (f"          ref: {ref}\n" if ref else "")
-                    + (f"          path: {ruta}\n" if ruta else "")
-                    + "      - uses: ./x\n")
-        errs = self.errores(self.revisar(wf(paso(IMPOSTOR))))
-        self.assertTrue(any("checkout de actions/checkout" in e["motivo"] and "ninguna rama" in e["motivo"]
-                            for e in errs), errs)
-        self.assertEqual(self.revisar(wf(paso(NUEVO))), [])
-        errs = self.errores(self.revisar(wf(paso("main"))))
+    def checkout(self, entradas, propio="FaroNovaCorp/x", base=None):
+        paso = (f"      - uses: actions/checkout@{LEGIT} # v7.0.1\n        with:\n"
+                + "".join(f"          {k}: {v}\n" for k, v in entradas)
+                + "      - uses: ./x\n")
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": propio}):
+            return self.errores(self.revisar(wf(paso), base=base))
+
+    def test_checkout_de_otro_repo(self):
+        errs = self.checkout([("repository", "actions/checkout"), ("ref", IMPOSTOR), ("path", "x")])
+        self.assertTrue(any("ninguna rama" in e["motivo"] for e in errs), errs)
+        self.assertEqual(self.checkout([("repository", "actions/checkout"), ("ref", NUEVO)]), [])
+        for ref in ("main", "v7", "${{ env.REF }}"):
+            errs = self.checkout([("repository", "actions/checkout"), ("ref", ref)])
+            self.assertTrue(any("sin SHA fijo" in e["motivo"] for e in errs), (ref, errs))
+        errs = self.checkout([("repository", "actions/checkout")])
         self.assertTrue(any("sin SHA fijo" in e["motivo"] for e in errs), errs)
-        errs = self.errores(self.revisar(wf(paso(None, ruta=None))))     # sin path: raíz del workspace
+
+    def test_checkout_inputs_como_el_runner(self):
+        # Mayúsculas en el nombre, espacios en el valor, path en expresión: igual se verifica.
+        errs = self.checkout([("Repository", "actions/checkout"), ("REF", f"' {IMPOSTOR} '"),
+                              ("path", "${{ 'x' }}")])
+        self.assertTrue(any("ninguna rama" in e["motivo"] for e in errs), errs)
+        errs = self.checkout([("repository", "actions/checkout"), ("ref", NUEVO), ("Ref", IMPOSTOR)])
+        self.assertTrue(errs, errs)                       # nombres repetidos sin mayúsculas: no verificable
+        errs = self.checkout([("repository", "${{ format('actions/{0}', 'checkout') }}"), ("ref", NUEVO)])
+        self.assertTrue(any("no verificable" in e["motivo"] for e in errs), errs)
+
+    def test_checkout_del_propio_repo(self):
+        propio = "Actions/Checkout"
+        # Patrones reales de la org: despliegue por inputs.ref, robot de migraciones, sidecar.
+        for entradas in ([("ref", "${{ github.event.pull_request.head.sha }}")], [("ref", "main")],
+                         [("ref", "${{ github.event.inputs.ref || github.sha }}")],
+                         [("ref", "${{ steps.plan.outputs.sha }}")], [("ref", "refs/heads/main")],
+                         [("repository", "${{ github.repository }}")], [("path", "sidecar")], [("ref", NUEVO)]):
+            self.assertEqual(self.checkout(entradas, propio=propio), [], entradas)
+        errs = self.checkout([("ref", IMPOSTOR)], propio=propio)          # sin repository: propio repo
+        self.assertTrue(any("ninguna rama" in e["motivo"] for e in errs), errs)
+        errs = self.checkout([("repository", "${{ github.repository }}"), ("ref", IMPOSTOR)], propio=propio)
+        self.assertTrue(any("ninguna rama" in e["motivo"] for e in errs), errs)
+
+    def test_checkout_de_la_org_en_main(self):
+        for entradas in ([("repository", "FaroNovaCorp/recursos-compartidos"), ("ref", "main")],
+                         [("repository", "${{ github.repository_owner }}/otro")],
+                         [("repository", "${{ github.repository_owner }}/${{ matrix.repo }}"), ("ref", "main")]):
+            self.assertEqual(self.checkout(entradas), [], entradas)
+        errs = self.checkout([("repository", "FaroNovaCorp/recursos-compartidos"), ("ref", "feat/x")])
         self.assertTrue(any("sin SHA fijo" in e["motivo"] for e in errs), errs)
-        self.assertEqual(self.revisar(wf(paso(IMPOSTOR, ruta="otra"))), [])  # ./x no cae bajo otra/
-        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "Actions/Checkout"}):
-            self.assertEqual(self.revisar(wf(paso("main"))), [])          # el propio repo
-        previo = wf(paso("main"))
+        errs = self.checkout([("repository", "${{ github.repository_owner }}/${{ matrix.repo }}"), ("ref", IMPOSTOR)])
+        self.assertTrue(any("no verificable" in e["motivo"] for e in errs), errs)
+
+    def test_checkout_en_accion_compuesta(self):
+        accion = ("name: carga\ndescription: carga\nruns:\n  using: composite\n  steps:\n"
+                  f"    - uses: actions/checkout@{LEGIT} # v7.0.1\n"
+                  f"      with:\n        repository: actions/checkout\n        ref: {IMPOSTOR}\n        path: x\n")
+        hall, _ = self.m.revisar_archivo("loader/action.yml", "", accion, self.m.Verificador())
+        self.assertTrue(any("ninguna rama" in e["motivo"] for e in self.errores(hall)), hall)
+
+    def test_checkout_previo_no_se_revisa(self):
+        previo = wf(f"      - uses: actions/checkout@{LEGIT} # v7.0.1\n"
+                    "        with:\n          repository: actions/checkout\n          ref: main\n")
         self.assertEqual(self.revisar(previo.replace("echo hola", "echo chao"), base=previo), [])
 
-    def test_sidecar_sin_repository_no_se_marca(self):
-        head = wf(f"      - uses: actions/checkout@{LEGIT} # v7.0.1\n"
-                  "        with:\n          path: sidecar\n"
-                  "      - uses: ./sidecar/accion\n")
-        self.assertEqual(self.revisar(head), [])
+    def test_clave_de_fusion_bloquea(self):
+        head = base_wf() + ("  b:\n    runs-on: ubuntu-latest\n    steps:\n"
+                            "      - <<: {uses: actions/checkout}\n")
+        errs = self.errores(self.revisar(head))
+        self.assertTrue(any("<<" in e["motivo"] for e in errs), errs)
 
     def test_alias_yaml_con_ancla_en_linea_nueva_se_verifica(self):
         head = base_wf() + (
