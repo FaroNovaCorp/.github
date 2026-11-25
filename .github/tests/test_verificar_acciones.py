@@ -307,6 +307,51 @@ class TestVerificacionPropia(Base):
         errs = self.errores(self.revisar(head))
         self.assertTrue(any("duplicada" in e["motivo"] for e in errs), errs)
 
+    def test_etiquetas_yaml_no_esconden_el_uses(self):
+        for etiqueta in ("!!omap", "!!pairs", "!!seq", "!custom"):
+            accion = ("name: demo\ndescription: demo\nruns:\n  using: composite\n"
+                      f"  steps: {etiqueta}\n"
+                      f"    - uses: actions/checkout@{IMPOSTOR} # v7.0.1\n")
+            hall, _ = self.m.revisar_archivo("local/action.yml", "", accion, self.m.Verificador())
+            self.assertTrue(any("no está en ninguna rama" in e["motivo"] for e in self.errores(hall)),
+                            (etiqueta, hall))
+        conjunto = f"jobs:\n  a:\n    steps: !!set\n      ? uses: actions/checkout@{IMPOSTOR} # v7.0.1\n"
+        hall, _ = self.m.revisar_archivo(".github/workflows/ci.yml", "", conjunto, self.m.Verificador())
+        self.assertTrue(self.errores(hall), hall)
+
+    def test_clave_uses_entre_comillas_duplicada_bloquea(self):
+        head = wf(f"      - uses: actions/checkout@{NUEVO} # v7.0.2\n"
+                  f'        "uses": actions/checkout@{IMPOSTOR} # v7.0.1\n')
+        errs = self.errores(self.revisar(head))
+        self.assertTrue(any("duplicada" in e["motivo"] for e in errs), errs)
+
+    def test_checkout_de_otro_repo_mas_uses_local(self):
+        def paso(ref, repo="actions/checkout", ruta="x"):
+            return (f"      - uses: actions/checkout@{LEGIT} # v7.0.1\n"
+                    f"        with:\n          repository: {repo}\n"
+                    + (f"          ref: {ref}\n" if ref else "")
+                    + (f"          path: {ruta}\n" if ruta else "")
+                    + "      - uses: ./x\n")
+        errs = self.errores(self.revisar(wf(paso(IMPOSTOR))))
+        self.assertTrue(any("checkout de actions/checkout" in e["motivo"] and "ninguna rama" in e["motivo"]
+                            for e in errs), errs)
+        self.assertEqual(self.revisar(wf(paso(NUEVO))), [])
+        errs = self.errores(self.revisar(wf(paso("main"))))
+        self.assertTrue(any("sin SHA fijo" in e["motivo"] for e in errs), errs)
+        errs = self.errores(self.revisar(wf(paso(None, ruta=None))))     # sin path: raíz del workspace
+        self.assertTrue(any("sin SHA fijo" in e["motivo"] for e in errs), errs)
+        self.assertEqual(self.revisar(wf(paso(IMPOSTOR, ruta="otra"))), [])  # ./x no cae bajo otra/
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "Actions/Checkout"}):
+            self.assertEqual(self.revisar(wf(paso("main"))), [])          # el propio repo
+        previo = wf(paso("main"))
+        self.assertEqual(self.revisar(previo.replace("echo hola", "echo chao"), base=previo), [])
+
+    def test_sidecar_sin_repository_no_se_marca(self):
+        head = wf(f"      - uses: actions/checkout@{LEGIT} # v7.0.1\n"
+                  "        with:\n          path: sidecar\n"
+                  "      - uses: ./sidecar/accion\n")
+        self.assertEqual(self.revisar(head), [])
+
     def test_alias_yaml_con_ancla_en_linea_nueva_se_verifica(self):
         head = base_wf() + (
             "  b:\n    runs-on: ubuntu-latest\n    steps:\n"

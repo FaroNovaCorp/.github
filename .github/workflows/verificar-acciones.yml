@@ -55,8 +55,11 @@ jobs:
           - Terceros: el comentario nombra un tag que apunta a ese SHA (`# vN`
             vale si algún `vN.x` apunta a él). Sin versión → rojo.
           - El par aparece literal en una línea añadida (corta escapes YAML,
-            alias y multilínea que esconden el valor real). Claves duplicadas
+            alias y multilínea que esconden el valor real). YAML leído como
+            árbol de nodos, sin etiquetas (como el runner). Claves duplicadas
             → rojo.
+          - `uses: ./p` bajo un checkout de OTRO repo (`repository:`) en la misma
+            lista de pasos: `ref:` debe ser un SHA alcanzable; si no → rojo.
           - Enlace simbólico bajo `.github/` o como action.yml → rojo. Submódulo o
             `.gitmodules` nuevo o modificado, en cualquier ruta → rojo.
           - zizmor (--no-config --no-ignores): impostor-commit en la línea de un
@@ -263,48 +266,97 @@ jobs:
               return nuevas
 
 
-          def cargar_yaml(texto):
-              """safe_load que además rechaza claves duplicadas (PyYAML se queda con la última)."""
+          def leer_yaml(texto):
+              """(raíz, error, línea): árbol de nodos YAML SIN construir.
+
+              Como el runner, se lee por tipo de nodo (mapa, lista, escalar) e ignora
+              las etiquetas: `!!omap`, `!!set` o `!!pairs` no esconden un `uses`.
+              Claves duplicadas → error (PyYAML se quedaría con la última).
+              """
               import yaml
-
-              class Cargador(yaml.SafeLoader):
-                  pass
-
-              def mapa(loader, nodo, deep=False):
-                  vistas = set()
-                  for k, _v in nodo.value:
-                      if k.tag == "tag:yaml.org,2002:merge":
-                          continue
-                      clave = loader.construct_object(k, deep=True)
-                      try:
-                          repetida = clave in vistas
-                          vistas.add(clave)
-                      except TypeError:
-                          continue
-                      if repetida:
-                          raise yaml.constructor.ConstructorError(
-                              None, None, f"clave duplicada {clave!r}", k.start_mark)
-                  return yaml.SafeLoader.construct_mapping(loader, nodo, deep)
-
-              Cargador.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapa)
-              return yaml.load(texto, Loader=Cargador)
+              try:
+                  raiz = yaml.compose(texto, Loader=yaml.SafeLoader)
+              except yaml.YAMLError as e:
+                  marca = getattr(e, "problem_mark", None)
+                  return None, f"YAML que no se puede leer: {getattr(e, 'problem', None) or e}", (
+                      marca.line + 1 if marca else None)
+              for n in nodos(raiz):
+                  if isinstance(n, yaml.MappingNode):
+                      vistas = set()
+                      for k, _v in n.value:
+                          if isinstance(k, yaml.ScalarNode) and k.value != "<<":
+                              if k.value in vistas:
+                                  return None, f"clave duplicada {k.value!r}", k.start_mark.line + 1
+                              vistas.add(k.value)
+              return raiz, None, None
 
 
-          def usos(doc):
-              """Todos los valores de claves `uses`, en cualquier nivel."""
-              out, vistos, pila = [], set(), [doc]
+          def nodos(raiz):
+              """Todos los nodos, una vez cada uno (los alias apuntan al mismo nodo)."""
+              import yaml
+              vistos, pila = set(), ([raiz] if raiz is not None else [])
               while pila:
                   n = pila.pop()
                   if id(n) in vistos:
                       continue
                   vistos.add(id(n))
-                  if isinstance(n, dict):
-                      for k, v in n.items():
-                          if k == "uses":
-                              out.append(v)
-                          pila.append(v)
-                  elif isinstance(n, list):
-                      pila.extend(n)
+                  yield n
+                  if isinstance(n, yaml.MappingNode):
+                      for k, v in n.value:
+                          pila += [k, v]
+                  elif isinstance(n, yaml.SequenceNode):
+                      pila += n.value
+
+
+          def campos(n):
+              import yaml
+              if not isinstance(n, yaml.MappingNode):
+                  return {}
+              return {k.value: v for k, v in n.value if isinstance(k, yaml.ScalarNode)}
+
+
+          def escalar(n):
+              import yaml
+              return n.value if isinstance(n, yaml.ScalarNode) else None
+
+
+          def usos(raiz):
+              """Valor de toda clave `uses`, en cualquier nivel (None si no es escalar)."""
+              import yaml
+              return [escalar(v) for n in nodos(raiz) if isinstance(n, yaml.MappingNode)
+                      for k, v in n.value if escalar(k) == "uses"]
+
+
+          def checkouts_locales(raiz):
+              """{(repositorio, ref, uso)}: `uses: ./p` bajo el path de un checkout de otro repo.
+
+              `actions/checkout` con `repository:` + `uses: ./…` en la misma lista de
+              pasos ejecuta un action.yml de ese repo y ref, fuera de toda clave `uses`.
+              """
+              import yaml
+              out = set()
+              for n in nodos(raiz):
+                  pasos = campos(n).get("steps")
+                  if not isinstance(pasos, yaml.SequenceNode):
+                      continue
+                  pasos = [campos(p) for p in pasos.value]
+                  ajenos = []
+                  for p in pasos:
+                      if (escalar(p.get("uses")) or "").split("@")[0].lower() != "actions/checkout":
+                          continue
+                      w = campos(p.get("with"))
+                      repo_ = (escalar(w.get("repository")) or "").strip()
+                      if repo_:
+                          ajenos.append((repo_, (escalar(w.get("ref")) or "").strip(),
+                                         os.path.normpath(escalar(w.get("path")) or ".")))
+                  for p in pasos:
+                      u = escalar(p.get("uses")) or ""
+                      if not u.startswith("./"):
+                          continue
+                      local = os.path.normpath(u)
+                      for repo_, ref, ruta in ajenos:
+                          if ruta == "." or local == ruta or local.startswith(ruta + "/"):
+                              out.add((repo_, ref, u))
               return out
 
 
@@ -462,27 +514,36 @@ jobs:
           def revisar_archivo(ruta, base_txt, head_txt, verif):
               """(hallazgos, líneas donde aparece algún par nuevo)."""
               import yaml
-              try:
-                  doc = cargar_yaml(head_txt)
-              except yaml.YAMLError as e:
-                  marca = getattr(e, "problem_mark", None)
-                  return [hallazgo("error", ruta, marca.line + 1 if marca else None, None,
-                                   f"YAML que no se puede leer: {getattr(e, 'problem', None) or e}")], set()
-              if not isinstance(doc, dict):
+              raiz, error, linea = leer_yaml(head_txt)
+              if error:
+                  return [hallazgo("error", ruta, linea, None, error)], set()
+              if not isinstance(raiz, yaml.MappingNode):
                   # Puntero de Git LFS, texto suelto o vacío: el manifiesto real no está
                   # aquí y no se puede verificar (checkout con `lfs: true` lo traería).
                   lfs = head_txt.startswith("version https://git-lfs.github.com/spec/")
                   return [hallazgo("error", ruta, 1, None,
                                    "puntero de Git LFS: el contenido real queda fuera de la verificación"
                                    if lfs else "no es un workflow ni una acción (la raíz no es un mapa)")], set()
-              try:
-                  previos = {u for u in usos(cargar_yaml(base_txt)) if isinstance(u, str)} if base_txt else set()
-              except yaml.YAMLError:
-                  previos = set()
+              raiz_base = leer_yaml(base_txt)[0] if base_txt else None
+              previos = {u for u in usos(raiz_base) if isinstance(u, str)}
               lineas = head_txt.splitlines()
               nuevas = sorted(lineas_nuevas(base_txt, head_txt))
               out, vistos, de_pares_nuevos = [], set(), set()
-              for uso in usos(doc):
+              propio = os.environ.get("GITHUB_REPOSITORY", "").lower()
+              for repo_, ref, uso in sorted(checkouts_locales(raiz) - checkouts_locales(raiz_base)):
+                  if repo_.lower() == propio:
+                      continue
+                  n = next((i for i, l in enumerate(lineas, 1) if aparece(uso, l)), None)
+                  m = re.fullmatch(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)", repo_)
+                  if m and SHA_RE.fullmatch(ref):
+                      motivo = verif.alcanzable(m.group(1), m.group(2), ref)
+                      if motivo:
+                          out.append(hallazgo("error", ruta, n, uso, f"acción local desde un checkout de {repo_}: {motivo}"))
+                  else:
+                      out.append(hallazgo("error", ruta, n, uso,
+                                          f"acción local desde un checkout de {repo_} sin SHA fijo "
+                                          f"(ref: {ref or 'por defecto'}): fija `ref:` a un SHA completo"))
+              for uso in usos(raiz):
                   if not isinstance(uso, str):
                       out.append(hallazgo("error", ruta, None, None, "`uses` que no es texto"))
                       continue

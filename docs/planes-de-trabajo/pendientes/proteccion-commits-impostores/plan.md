@@ -86,8 +86,9 @@ Secundarios:
 - Triggers `pull_request` + `merge_group`; sin `cancel-in-progress`; `contents: read`; `ubuntu-24.04`; sin checkout del código del PR.
 - Qué mete el cambio en main: PR → merge de prueba (`GITHUB_SHA`) contra su primer padre; cola → `base_sha`…`head_sha`. Un PR atrasado no hereda los cambios de main.
 - Diff de árboles incremental por API (solo directorios que cambiaron; sin el tope de 7 MB del árbol recursivo). Relevantes: `.github/workflows/*.yml|yaml` de primer nivel (los únicos que GitHub carga) y `action.yml|action.yaml` en cualquier ruta. Sin relevantes → verde sin instalar nada.
-- Enlace simbólico o submódulo nuevo bajo `.github/` o como `action.yml` → rojo (hoy: 0 en la org).
-- YAML con PyYAML (venv, `--require-hashes`); claves duplicadas → rojo.
+- Enlace simbólico bajo `.github/` o como `action.yml` → rojo. Submódulo o `.gitmodules` nuevo, en cualquier ruta → rojo. Puntero de Git LFS o raíz que no es mapa → rojo (hoy: 0 de cada uno en la org).
+- YAML como árbol de nodos sin construir (PyYAML `compose`, venv, `--require-hashes`): etiquetas como `!!omap` no esconden nada, igual que en el runner. Claves duplicadas → rojo.
+- `uses: ./p` bajo un checkout de otro repo (`repository:`): `ref:` debe ser un SHA alcanzable.
 - Pares nuevos = `uses` de head que no estaban en la base. Por cada uno:
   - SHA completo de 40.
   - Commit existe en el repo dueño.
