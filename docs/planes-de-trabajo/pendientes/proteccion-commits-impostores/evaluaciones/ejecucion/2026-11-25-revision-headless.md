@@ -3,13 +3,13 @@
 **Fecha:** 2026-11-25
 **Metodo:** Equipo headless: Claude Code (agente aislado) + revisor externo Codex `gpt-6-astra` · xhigh · nivel delicado
 **Alcance:** F1 (`.github/workflows/verificar-acciones.yml` + `.github/tests/test_verificar_acciones.py`). F2-F5 fuera.
-**Rondas:** 3
-**Veredicto final:** PENDIENTE-RONDA-3
+**Rondas:** 5 (máximo)
+**Veredicto final:** CAMBIOS REQUERIDOS en ronda 5, aplicados por el dueño del cambio (regla 6); validación en vivo en F3
 
 ## Cumplimiento del plan (F1)
 - Subtareas: 6/6 (triggers y permisos, qué mete el cambio en main, diff por API, verificación propia, zizmor, resumen y anotaciones).
 - Archivos: 2/2.
-- Pruebas: 47 OK; humo contra la API real (impostor de Trivy → rojo; setup-node en `releases/v6` → verde; PRs reales de agente-de-monitoreo → verde).
+- Pruebas: 57 OK; ensayo en seco sobre los 94 workflows y action.yml de main de la org: 0 errores; humo contra la API real (impostor de Trivy → rojo; setup-node en `releases/v6` → verde; PRs reales de agente-de-monitoreo → verde).
 
 ## Ronda 1 (b1e5aa9) — ambos CAMBIOS REQUERIDOS
 
