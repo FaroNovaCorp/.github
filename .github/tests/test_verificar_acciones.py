@@ -360,10 +360,28 @@ class TestVerificacionPropia(Base):
                          [("ref", "${{ steps.plan.outputs.sha }}")], [("ref", "refs/heads/main")],
                          [("repository", "${{ github.repository }}")], [("path", "sidecar")], [("ref", NUEVO)]):
             self.assertEqual(self.checkout(entradas, propio=propio), [], entradas)
-        errs = self.checkout([("ref", IMPOSTOR)], propio=propio)          # sin repository: propio repo
-        self.assertTrue(any("ninguna rama" in e["motivo"] for e in errs), errs)
+        for ref in (IMPOSTOR, IMPOSTOR.upper()):                          # sin repository: propio repo
+            errs = self.checkout([("ref", ref)], propio=propio)
+            self.assertTrue(any("ninguna rama" in e["motivo"] for e in errs), (ref, errs))
         errs = self.checkout([("repository", "${{ github.repository }}"), ("ref", IMPOSTOR)], propio=propio)
         self.assertTrue(any("ninguna rama" in e["motivo"] for e in errs), errs)
+        # Rama sin mergear, PR de un fork, tag, constante disfrazada de expresión: nadie verificó ese árbol.
+        for ref in ("rama-sin-mergear", "refs/pull/9/head", "v1.0.0", "${{ 'rama' }}",
+                    "${{ github.sha && 'rama' }}"):
+            errs = self.checkout([("ref", ref)], propio=propio)
+            self.assertTrue(any("propio repo" in e["motivo"] for e in errs), (ref, errs))
+
+    def test_checkout_con_subruta_o_servidor_ajeno(self):
+        paso = (f"      - uses: actions/checkout/.@{LEGIT} # v7.0.1\n"
+                f"        with:\n          repository: actions/checkout\n          ref: {IMPOSTOR}\n"
+                "      - uses: ./x\n")
+        errs = self.errores(self.revisar(wf(paso)))
+        self.assertTrue(any("subruta" in e["motivo"] for e in errs), errs)
+        self.assertTrue(any("ninguna rama" in e["motivo"] for e in errs), errs)
+        errs = self.checkout([("github-server-url", "https://evil.example.com")])
+        self.assertTrue(any("servidor" in e["motivo"] for e in errs), errs)
+        self.assertEqual(self.checkout([("github-server-url", "https://github.com")]), [])
+        self.assertEqual(self.checkout([("github-server-url", "${{ github.server_url }}")]), [])
 
     def test_checkout_de_la_org_en_main(self):
         for entradas in ([("repository", "FaroNovaCorp/recursos-compartidos"), ("ref", "main")],

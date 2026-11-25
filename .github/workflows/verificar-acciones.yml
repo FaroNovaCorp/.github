@@ -20,7 +20,10 @@ name: verificar-acciones
 # - Límites: reusables de OTRO repo privado de la org dan rojo (el GITHUB_TOKEN
 #   no los ve); hoy solo se usa FaroNovaCorp/.github, que es público. No frena
 #   la ejecución de un impostor en el CI del propio PR: eso es la política de
-#   lockfiles (plan, F5).
+#   lockfiles (plan, F5). No mira código en `run:` ni acciones que escriben un
+#   action.yml en el workspace (download-artifact, cache) antes de un
+#   `uses: ./…`: revisión del PR y /cambios-criticos. «Repo de la org en main»
+#   incluye los 4 repos sin flujo de PR, que quedan fuera del ruleset.
 # Plan: docs/planes-de-trabajo/pendientes/proteccion-commits-impostores/plan.md
 # Tests: python3 -m unittest discover -s .github/tests -p 'test_*.py'
 
@@ -345,12 +348,18 @@ jobs:
               out = set()
               for n in nodos(raiz):
                   c = campos(n)
-                  if (escalar(c.get("uses")) or "").strip().split("@")[0].lower() != "actions/checkout":
+                  m = USES_RE.fullmatch((escalar(c.get("uses")) or "").strip())
+                  # Dueño y repo, con cualquier subruta (`actions/checkout/.@sha` es el mismo).
+                  if not m or f"{m.group(1)}/{m.group(2)}".lower() != "actions/checkout":
                       continue
                   w = campos(c.get("with"))
                   entradas_ = {k.lower(): (escalar(v) or "").strip() for k, v in w.items()}
                   if len(entradas_) != len(w):
                       out.add(("(inputs repetidos)", ""))
+                      continue
+                  servidor = entradas_.get("github-server-url", "")
+                  if servidor and servidor.rstrip("/") not in ("https://github.com", "${{ github.server_url }}"):
+                      out.add((f"(servidor {servidor})", ""))
                       continue
                   repo_, ref = entradas_.get("repository", ""), entradas_.get("ref", "")
                   if repo_ or ref:
@@ -358,31 +367,46 @@ jobs:
               return out
 
 
+          # Expresión que solo lee contextos, unidos por `||` (sin constantes):
+          # `${{ github.event.inputs.ref || github.sha }}`, `${{ steps.plan.outputs.sha }}`.
+          CTX = r"(?:github|inputs|steps|needs|matrix|env|vars)\.[A-Za-z0-9_.-]+"
+          REF_CALCULADA = re.compile(r"\$\{\{\s*" + CTX + r"(?:\s*\|\|\s*" + CTX + r")*\s*\}\}")
+          RAMA_DEFECTO = ("", "main", "refs/heads/main")
+
+
           def verificar_checkout(repo_, ref, verif):
               """Motivo de rojo, o None.
 
-              - Propio repo: un SHA literal debe ser alcanzable (un commit de un fork
-                del propio repo también resuelve). Ramas y expresiones (`inputs.ref`,
-                `steps.*.outputs`) eligen código del propio repo o se calculan en
-                ejecución: lo mismo que un `run:`, fuera de este check.
-              - Repo de la org: `main` (o sin ref); un SHA literal, alcanzable.
-              - Otro repo: nombre literal y SHA alcanzable. Lo demás → rojo.
+              - SHA literal (sin distinguir mayúsculas): alcanzable, en cualquier repo
+                (un commit de un fork del propio repo también resuelve).
+              - Propio repo: `main` o una ref calculada en ejecución (solo contextos):
+                lo mismo que un `run:`, fuera de este check. Otra rama, `refs/pull/N`,
+                tag o expresión constante → rojo: elige un árbol que nadie verificó.
+              - Repo de la org: `main` (o sin ref).
+              - Otro repo: nombre literal y SHA. Lo demás → rojo.
               """
+              if repo_.startswith("("):
+                  return f"checkout no verificable: {repo_.strip('()')}"
               propio = os.environ.get("GITHUB_REPOSITORY", "")
               r = re.sub(r"\$\{\{\s*github\.repository_owner\s*\}\}", propio.split("/")[0], repo_)
               if re.fullmatch(r"\$\{\{\s*github\.repository\s*\}\}", r):
                   r = propio
               literal = re.fullmatch(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)", r)
+              sha = ref.lower() if re.fullmatch(r"[0-9a-fA-F]{40}", ref) else None
               if not r or r.lower() == propio.lower():
-                  if SHA_RE.fullmatch(ref) and propio:
-                      return verif.alcanzable(*propio.split("/", 1), ref)
-                  return None
+                  if sha and propio:
+                      return verif.alcanzable(*propio.split("/", 1), sha)
+                  if ref in RAMA_DEFECTO or REF_CALCULADA.fullmatch(ref):
+                      return None
+                  return (f"checkout del propio repo con `ref: {ref}`: rama, PR o tag que no pasó por "
+                          "este check; usa main, un SHA alcanzable o una ref del evento")
               dueno = r.split("/", 1)[0]
-              if SHA_RE.fullmatch(ref):
+              ref = sha or ref
+              if sha:
                   if not literal:
                       return f"checkout de `{repo_}` con SHA: repositorio no verificable; escríbelo literal"
                   return verif.alcanzable(literal.group(1), literal.group(2), ref)
-              if dueno.lower() == ORG and ref in ("", "main", "refs/heads/main"):
+              if dueno.lower() == ORG and ref in RAMA_DEFECTO:
                   return None
               if not literal:
                   return f"checkout de `{repo_}`: repositorio no verificable; escríbelo literal"
@@ -521,7 +545,9 @@ jobs:
                   m = USES_RE.fullmatch(uso)
                   if not m:
                       return [hallazgo("error", ruta, n0, uso, "forma de `uses` no reconocida")]
-                  dueno, repo, _sub, ref = m.groups()
+                  dueno, repo, sub, ref = m.groups()
+                  if any(s in (".", "..", "") for s in sub.split("/")[1:]):
+                      return [hallazgo("error", ruta, n0, uso, "subruta con `.`, `..` o `//`: escríbela canónica")]
                   if not SHA_RE.fullmatch(ref):
                       return [hallazgo("error", ruta, n0, uso,
                                        f"no está fijado por SHA completo (`@{ref}`)")]

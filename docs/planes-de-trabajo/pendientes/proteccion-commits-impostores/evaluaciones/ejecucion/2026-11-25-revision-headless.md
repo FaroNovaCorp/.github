@@ -3,13 +3,13 @@
 **Fecha:** 2026-11-25
 **Metodo:** Equipo headless: Claude Code (agente aislado) + revisor externo Codex `gpt-6-astra` · xhigh · nivel delicado
 **Alcance:** F1 (`.github/workflows/verificar-acciones.yml` + `.github/tests/test_verificar_acciones.py`). F2-F5 fuera.
-**Rondas:** 3
-**Veredicto final:** PENDIENTE-RONDA-3
+**Rondas:** 5 (máximo)
+**Veredicto final:** CAMBIOS REQUERIDOS en ronda 5, aplicados por el dueño del cambio (regla 6); validación en vivo en F3
 
 ## Cumplimiento del plan (F1)
 - Subtareas: 6/6 (triggers y permisos, qué mete el cambio en main, diff por API, verificación propia, zizmor, resumen y anotaciones).
 - Archivos: 2/2.
-- Pruebas: 47 OK; humo contra la API real (impostor de Trivy → rojo; setup-node en `releases/v6` → verde; PRs reales de agente-de-monitoreo → verde).
+- Pruebas: 57 OK; ensayo en seco sobre los 94 workflows y action.yml de main de la org: 0 errores; humo contra la API real (impostor de Trivy → rojo; setup-node en `releases/v6` → verde; PRs reales de agente-de-monitoreo → verde).
 
 ## Ronda 1 (b1e5aa9) — ambos CAMBIOS REQUERIDOS
 
@@ -56,9 +56,17 @@
 
 Ensayo en seco tras el fix: 8 falsos rojos en patrones reales (despliegue por `inputs.ref`, robot de migraciones, propagación por matriz) → regla ajustada → 0 sobre los 94 archivos de la org.
 
-## Ronda 5
+## Ronda 5 (86bdb34) — ambos CAMBIOS REQUERIDOS · última ronda (máx. 5)
 
-PENDIENTE
+| Hallazgo | Revisor | F×G | Fix (c31649d) |
+|---|---|---|---|
+| `actions/checkout/.@sha` no se reconoce como checkout | ambos | 27 / 14 | checkout por dueño/repo con cualquier subruta; subruta con `.`, `..` o `//` → rojo |
+| Propio repo con ref literal: rama sin mergear, `refs/pull/N/head`, SHA en mayúsculas, constante en expresión | ambos | 27 / 14 | propio repo: `main`, SHA alcanzable (sin distinguir mayúsculas) o expresión que solo lee contextos unidos por `\|\|` |
+| `github-server-url` ajeno baja el árbol de otro servidor | Claude | 14 | rojo si no es github.com |
+| Otras acciones que escriben un action.yml (download-artifact, cache) | Claude | 7 | límite aceptado, en la cabecera |
+| «Org en main» incluye los 4 repos fuera del ruleset | Claude | 6 | límite aceptado, en la cabecera |
+
+Decisión del dueño del cambio tras la ronda 5 (regla 6): fixes aplicados con 57 pruebas y ensayo en seco (94 archivos de la org, 0 errores); validación en vivo en F3 (Evaluate + PRs de prueba). Sin ronda 6.
 
 ## Desviaciones del plan (aceptadas)
 - Lista de archivos por diff de árboles, no por `pulls/N/files`/`compare` (sin topes de 3.000/300 archivos).
@@ -66,7 +74,8 @@ PENDIENTE
 - zizmor `ref-version-mismatch` avisa; la verificación propia de versión es la que bloquea.
 
 ## Límites aceptados (fuera de F1)
-- Código arbitrario en `run:` (incluye refs calculadas en ejecución): revisión del PR y `/cambios-criticos`.
+- Código arbitrario en `run:` (incluye refs calculadas en ejecución) y acciones que escriben un action.yml en el workspace: revisión del PR y `/cambios-criticos`.
+- «Repo de la org en main» incluye los 4 repos sin flujo de PR, fuera del ruleset.
 - Ejecución del impostor en el CI del propio PR, antes del merge: F5 (lockfiles).
 - Cualquier `dueño/repo@sha` en una rama de su dueño pasa: no hay lista de dueños permitidos.
 
