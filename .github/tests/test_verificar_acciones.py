@@ -336,6 +336,15 @@ class TestVerificacionPropia(Base):
         errs = self.errores(self.revisar("jobs: [\n"))
         self.assertIn("YAML", errs[0]["motivo"])
 
+    def test_puntero_lfs_o_raiz_que_no_es_mapa_bloquea(self):
+        lfs = ("version https://git-lfs.github.com/spec/v1\n"
+               "oid sha256:" + "a" * 64 + "\nsize 512\n")
+        errs = self.errores(self.revisar(lfs))
+        self.assertIn("Git LFS", errs[0]["motivo"])
+        for texto in ("", "solo texto\n", "- uses: x\n"):
+            errs = self.errores(self.revisar(texto))
+            self.assertTrue(errs and "raíz no es un mapa" in errs[0]["motivo"], texto)
+
     def test_cache_por_par(self):
         head = wf(f"      - uses: actions/checkout@{NUEVO} # v7.0.2\n"
                   f"      - uses: actions/checkout@{NUEVO} # v7.0.2\n")
@@ -359,9 +368,9 @@ class TestDetectar(Base):
             {"ruta": "sub/dir/action.yaml", "base": None, "head": "s1"},
         ])
         self.assertEqual(prohibidos, [])
-        # `src/` no cambió: no se baja a ese subárbol.
-        arboles_src = [r for r in self.gh.llamadas if "git/trees" in r]
-        self.assertLessEqual(len(arboles_src), 8)
+        # `src/` no cambió: no se baja a ese subárbol (raíz, .github, workflows, sub, dir).
+        arboles = [r for r in self.gh.llamadas if "git/trees" in r]
+        self.assertLessEqual(len(arboles), 10)
 
     def test_enlace_simbolico_y_submodulo_prohibidos(self):
         b = self.gh.arbol({"README.md": ("r1", "100644")})
@@ -369,10 +378,14 @@ class TestDetectar(Base):
                            "local/action.yml": ("../payload/manifest.yml", "120000"),
                            ".github/actions/x": ("../../vendor/x", "120000"),
                            ".github/vendor": ("c" * 40, "160000"),
+                           "vendor/checkout": ("d" * 40, "160000"),
+                           ".gitmodules": ("gm1", "100644"),
                            "docs/enlace.md": ("../README.md", "120000")})
         cambios, prohibidos = self.m.detectar("FaroNovaCorp/x", b, h)
         self.assertEqual(cambios, [])
-        self.assertEqual([r for r, _ in prohibidos], [".github/actions/x", ".github/vendor", "local/action.yml"])
+        self.assertEqual([r for r, _ in prohibidos],
+                         [".github/actions/x", ".github/vendor", ".gitmodules", "local/action.yml",
+                          "vendor/checkout"])
 
 
 class TestPiezas(Base):
@@ -469,6 +482,35 @@ class TestPiezas(Base):
             self.assertEqual([r["name"] for r in mod.api_paginado("repos/a/b/branches?per_page=100")],
                              ["uno", "dos"])
 
+    def test_pedir_reintenta_limite_secundario(self):
+        mod = cargar_script()
+
+        class Resp(io.BytesIO):
+            status, headers = 200, {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        respuestas = [(403, {"Retry-After": "1"}, b""),
+                      (403, {"X-RateLimit-Remaining": "12"}, b"You have exceeded a secondary rate limit"),
+                      Resp(b'{"ok": true}')]
+        esperas = []
+
+        def urlopen(req, timeout):
+            r = respuestas.pop(0)
+            if isinstance(r, tuple):
+                raise urllib.error.HTTPError(req.full_url, r[0], "x", r[1], io.BytesIO(r[2]))
+            return r
+
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "fake"}), \
+                mock.patch.object(mod.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(mod.time, "sleep", esperas.append):
+            self.assertEqual(mod.api("repos/a/b"), (200, {"ok": True}))
+        self.assertEqual(esperas, [1, 30])
+
     def test_pedir_404_y_limite_agotado(self):
         mod = cargar_script()
 
@@ -505,6 +547,7 @@ class TestMain(Base):
         h = self.gh.arbol(head_arch)
         self.gh.padres = {"MERGE": [b if p == "B" else p for p in padres]}
         self.gh.arboles["MERGE"] = self.gh.arboles[h]
+        self.gh.arboles["PRHEAD"] = self.gh.arboles[h]
         self.gh.arboles["B"] = self.gh.arboles[b]
         self.gh.blobs = {"x1": base_wf(), "x2": BASE.replace("{LEGIT}", IMPOSTOR),
                          "x3": BASE.replace("{LEGIT}", NUEVO).replace("v7.0.1", "v7.0.2")}
@@ -550,6 +593,18 @@ class TestMain(Base):
         rc, inst = self.correr(self.PR, "pull_request", {"README.md": ("r1", "100644")},
                                {"README.md": ("r1", "100644"), "a/action.yml": ("../m.yml", "120000")})
         self.assertEqual((rc, inst), (1, []))
+
+    def test_sin_merge_de_prueba_compara_contra_la_punta(self):
+        arch_b = {".github/workflows/ci.yml": ("x1", "100644")}
+        arch_h = {".github/workflows/ci.yml": ("x2", "100644")}
+        for padres in (("PRHEAD",), ("PRHEAD", "B")):   # un padre, o padres al revés
+            rc, inst = self.correr(self.PR, "pull_request", arch_b, arch_h, padres=padres)
+            self.assertEqual((rc, inst), (1, [True]), padres)
+            self.assertIn("repos/FaroNovaCorp/x/git/trees/B", self.gh.llamadas)
+
+    def test_pull_request_target_no_se_acepta(self):
+        rc, _ = self.correr(self.PR, "pull_request_target", {"a": ("1", "100644")}, {"a": ("1", "100644")})
+        self.assertEqual(rc, 1)
 
     def test_cola_con_impostor_falla(self):
         ev = {"merge_group": {"base_sha": "B", "head_sha": "MERGE"}}

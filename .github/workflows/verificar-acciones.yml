@@ -57,7 +57,8 @@ jobs:
           - El par aparece literal en una línea añadida (corta escapes YAML,
             alias y multilínea que esconden el valor real). Claves duplicadas
             → rojo.
-          - Enlace simbólico o submódulo bajo `.github/` o como action.yml → rojo.
+          - Enlace simbólico bajo `.github/` o como action.yml → rojo. Submódulo o
+            `.gitmodules` nuevo o modificado, en cualquier ruta → rojo.
           - zizmor (--no-config --no-ignores): impostor-commit en la línea de un
             par nuevo → rojo; ref-version-mismatch, líneas previas o zizmor que
             no lee el archivo → aviso (la verificación propia es la autoridad).
@@ -124,14 +125,17 @@ jobs:
                       with urllib.request.urlopen(req, timeout=30) as r:
                           return r.status, r.read(), r.headers
                   except urllib.error.HTTPError as e:
+                      cuerpo = e.read(2000).lower() if e.fp else b""
                       e.close()
                       if e.code in (404, 409, 422):
                           return e.code, b"", e.headers
-                      if e.code in (403, 429) and e.headers.get("X-RateLimit-Remaining") == "0":
+                      secundario = e.code in (403, 429) and (
+                          e.headers.get("Retry-After") or b"secondary rate limit" in cuerpo)
+                      if e.code in (403, 429) and not secundario and e.headers.get("X-RateLimit-Remaining") == "0":
                           raise ErrorApi(f"límite de la API de GitHub agotado en {url}") from None
-                      if e.code < 500 and not (e.code in (403, 429) and e.headers.get("Retry-After")):
+                      if e.code < 500 and not secundario:
                           raise ErrorApi(f"HTTP {e.code} en {url}") from None
-                      espera = min(int(e.headers.get("Retry-After") or espera), 30)
+                      espera = min(int(e.headers.get("Retry-After") or (30 if secundario else espera)), 60)
                   except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
                       pass
                   if intento < 3:
@@ -178,22 +182,22 @@ jobs:
               nombre = os.environ["GITHUB_EVENT_NAME"]
               if nombre == "merge_group":
                   return ev["merge_group"]["base_sha"], ev["merge_group"]["head_sha"]
-              if nombre not in ("pull_request", "pull_request_target"):
+              if nombre != "pull_request":
                   raise ErrorApi(f"evento no soportado: {nombre}")
-              # En pull_request, GITHUB_SHA es el merge de prueba (refs/pull/N/merge):
-              # sus padres son [punta de la base, head del PR].
+              # GITHUB_SHA es el merge de prueba (refs/pull/N/merge): padres = [punta
+              # de la base, head del PR]. Se exige ese orden; si no, punta de la base
+              # contra head del PR: más estricto (un PR atrasado revisa también lo
+              # que main cambió), nunca más laxo.
+              pr = ev["pull_request"]
               head = os.environ["GITHUB_SHA"]
               st, c = api(f"repos/{repo}/git/commits/{head}")
               if st != 200:
                   raise ErrorApi(f"no se pudo leer el commit {head[:12]} (HTTP {st})")
               padres = [p["sha"] for p in c.get("parents", [])]
-              if len(padres) == 2:
+              if len(padres) == 2 and padres[1] == pr["head"]["sha"]:
                   return padres[0], head
-              pr = ev["pull_request"]
-              st, d = api(f"repos/{repo}/compare/{pr['base']['sha']}...{pr['head']['sha']}?per_page=1")
-              if st != 200:
-                  raise ErrorApi(f"no se pudo calcular el merge-base (HTTP {st})")
-              return d["merge_base_commit"]["sha"], pr["head"]["sha"]
+              print("::warning title=verificar-acciones::sin merge de prueba; se compara contra la punta de la base")
+              return pr["base"]["sha"], pr["head"]["sha"]
 
 
           def entradas(repo, sha):
@@ -226,10 +230,13 @@ jobs:
                               if e["type"] == "tree":
                                   nivel.append((ruta + "/", previo["sha"] if previo and previo["type"] == "tree"
                                                 else None, e["sha"]))
-                              elif e["mode"] == "120000" or e["type"] == "commit":
+                              elif e["type"] == "commit" or ruta == ".gitmodules":
+                                  # Submódulo en cualquier ruta: `uses: ./vendor/x` con checkout
+                                  # `submodules: true` correría un commit ajeno. Hoy: 0 en la org.
+                                  prohibidos.append((ruta, "submódulo"))
+                              elif e["mode"] == "120000":
                                   if es_sensible(ruta):
-                                      prohibidos.append((ruta, "enlace simbólico" if e["mode"] == "120000"
-                                                         else "submódulo"))
+                                      prohibidos.append((ruta, "enlace simbólico"))
                               elif e["type"] == "blob" and es_relevante(ruta):
                                   base_blob = (previo["sha"] if previo and previo["type"] == "blob"
                                                and previo["mode"] != "120000" else None)
@@ -360,7 +367,7 @@ jobs:
                           lote = revisar[i:i + LOTE]
                           if any(ex.map(lambda r: self.contiene(full, r["name"], sha), lote)):
                               return None
-                  if len(ramas) >= MAX_RAMAS:
+                  if len(ramas) > MAX_RAMAS:
                       return (f"búsqueda incompleta: {full} tiene {len(ramas)}+ ramas y el commit "
                               f"{sha[:12]} no está en las {len(revisar)} revisadas; pide revisión a un owner")
                   return (f"el commit {sha[:12]} no está en ninguna rama de {full}: "
@@ -461,6 +468,13 @@ jobs:
                   marca = getattr(e, "problem_mark", None)
                   return [hallazgo("error", ruta, marca.line + 1 if marca else None, None,
                                    f"YAML que no se puede leer: {getattr(e, 'problem', None) or e}")], set()
+              if not isinstance(doc, dict):
+                  # Puntero de Git LFS, texto suelto o vacío: el manifiesto real no está
+                  # aquí y no se puede verificar (checkout con `lfs: true` lo traería).
+                  lfs = head_txt.startswith("version https://git-lfs.github.com/spec/")
+                  return [hallazgo("error", ruta, 1, None,
+                                   "puntero de Git LFS: el contenido real queda fuera de la verificación"
+                                   if lfs else "no es un workflow ni una acción (la raíz no es un mapa)")], set()
               try:
                   previos = {u for u in usos(cargar_yaml(base_txt)) if isinstance(u, str)} if base_txt else set()
               except yaml.YAMLError:
