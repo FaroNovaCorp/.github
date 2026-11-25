@@ -1,0 +1,747 @@
+name: verificar-acciones
+
+# P-1047 (SHP2) · defensa contra commits impostores en `uses:`.
+# - Ataque: `dueño/repo@<sha>` resuelve también un commit que solo vive en un
+#   fork (la red de forks comparte objetos). Caso Trivy, mar-2026. El pin por
+#   SHA obligatorio de la org no lo frena.
+# - Lo exige el ruleset de org «verificar-acciones-p1047», fijado por sha de
+#   este archivo: corre en todo PR y en la cola de todo repo con flujo de PR.
+#   Cambiar este archivo no cambia el check hasta que un owner mueva ese sha.
+# - Regla `workflows` de rulesets: ignora filtros `paths`, corre siempre. Por
+#   eso el filtro va adentro: PR sin workflows ni action.yml cambiados → verde
+#   en segundos, sin instalar nada.
+# - Mide lo que el PR mete en main: merge de prueba contra su primer padre
+#   (PR) o base de la cola (merge_group). Un PR atrasado no hereda como suyos
+#   los cambios que main hizo en sus workflows.
+# - Bloquea solo pares acción@SHA nuevos. Lo que ya estaba en main avisa aquí
+#   y lo detecta la revisión semanal de /cambios-criticos (patrón 8).
+# - Nunca hace checkout ni ejecuta código del PR: lee el diff por API.
+# - Sin `concurrency`/`cancel-in-progress`: la doc de rulesets lo desaconseja.
+# - Límites: reusables de OTRO repo privado de la org dan rojo (el GITHUB_TOKEN
+#   no los ve); hoy solo se usa FaroNovaCorp/.github, que es público. No frena
+#   la ejecución de un impostor en el CI del propio PR: eso es la política de
+#   lockfiles (plan, F5). No mira código en `run:` ni acciones que escriben un
+#   action.yml en el workspace (download-artifact, cache) antes de un
+#   `uses: ./…`: revisión del PR y /cambios-criticos. «Repo de la org en main»
+#   incluye los 4 repos sin flujo de PR, que quedan fuera del ruleset.
+# Plan: docs/planes-de-trabajo/pendientes/proteccion-commits-impostores/plan.md
+# Tests: python3 -m unittest discover -s .github/tests -p 'test_*.py'
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  verificar:
+    name: verificar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Verificar acciones
+        shell: python3 -I {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          """Verifica que todo `uses:` nuevo salga de una rama del repo dueño.
+
+          Por cada par acción@SHA que el cambio agrega a un workflow o action.yml:
+          - SHA completo de 40 caracteres.
+          - El commit existe en el repo dueño y es alcanzable desde una RAMA
+            suya (rama por defecto primero, luego releases, luego el resto).
+            Solo-fork (impostor) o solo-tag (tag movido fuera de la historia)
+            → rojo. Búsqueda que no termina → rojo, con su motivo.
+          - Reusables propios (FaroNovaCorp/*): en la rama por defecto; el
+            comentario es libre.
+          - Terceros: el comentario nombra un tag que apunta a ese SHA (`# vN`
+            vale si algún `vN.x` apunta a él). Sin versión → rojo.
+          - El par aparece literal en una línea añadida (corta escapes YAML,
+            alias y multilínea que esconden el valor real). YAML leído como
+            árbol de nodos, sin etiquetas (como el runner). Claves duplicadas
+            → rojo.
+          - Todo `actions/checkout` nuevo que elige otro árbol (`repository:` o
+            `ref:`) se verifica, porque un `uses: ./…` posterior correría su
+            action.yml: SHA literal → alcanzable · repo de la org en `main` ·
+            propio repo con rama o expresión. Otro repo sin SHA → rojo. Clave
+            `<<` → rojo.
+          - Enlace simbólico bajo `.github/` o como action.yml → rojo. Submódulo o
+            `.gitmodules` nuevo o modificado, en cualquier ruta → rojo.
+          - zizmor (--no-config --no-ignores): impostor-commit en la línea de un
+            par nuevo → rojo; ref-version-mismatch, líneas previas o zizmor que
+            no lee el archivo → aviso (la verificación propia es la autoridad).
+          """
+          import base64
+          import difflib
+          import glob
+          import http.client
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from concurrent.futures import ThreadPoolExecutor
+
+          API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+          ORG = "faronovacorp"
+          SHA_RE = re.compile(r"[0-9a-f]{40}")
+          USES_RE = re.compile(
+              r"([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)((?:/[^@\s]+)?)@([^@\s]+)"
+          )
+          # Versión en el comentario: `v7`, `v7.0.1`, `7.0.1`, `tag=v7.0.1`,
+          # `v1.2.3-rc.1`. Un número suelto (`P-144`, `#19`) no es versión.
+          VER_RE = re.compile(
+              r"(?:^|[\s=@(:])((?:v\d+(?:\.\d+)*|\d+(?:\.\d+)+)(?:-[0-9A-Za-z][0-9A-Za-z.]*)?)(?![\w.-])"
+          )
+          MAX_RAMAS = 300
+          LOTE = 8
+          TMP = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
+          VENV = os.path.join(TMP, "verificar-acciones-venv")
+          # Versiones fijas por hash (pip --require-hashes). zizmor: wheel
+          # manylinux x86_64 (runner ubuntu-24.04). PyYAML: cp312, cp313, cp314.
+          REQUISITOS = (
+              "zizmor==1.32.0"
+              " --hash=sha256:84a6acb975accc13408786a2bd274b572537ca19c933ebbc13e78f3988562071\n"
+              "pyyaml==6.0.3"
+              " --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc"
+              " --hash=sha256:0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6"
+              " --hash=sha256:c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5\n"
+          )
+
+
+          class ErrorApi(Exception):
+              pass
+
+
+          # ---------------------------------------------------------------- API
+
+          def _pedir(url):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "faronova-verificar-acciones",
+              })
+              for intento in range(4):
+                  espera = 2 ** intento
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          return r.status, r.read(), r.headers
+                  except urllib.error.HTTPError as e:
+                      cuerpo = e.read(2000).lower() if e.fp else b""
+                      e.close()
+                      if e.code in (404, 409, 422):
+                          return e.code, b"", e.headers
+                      secundario = e.code in (403, 429) and (
+                          e.headers.get("Retry-After") or b"secondary rate limit" in cuerpo)
+                      if e.code in (403, 429) and not secundario and e.headers.get("X-RateLimit-Remaining") == "0":
+                          raise ErrorApi(f"límite de la API de GitHub agotado en {url}") from None
+                      if e.code < 500 and not secundario:
+                          raise ErrorApi(f"HTTP {e.code} en {url}") from None
+                      espera = min(int(e.headers.get("Retry-After") or (30 if secundario else espera)), 60)
+                  except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
+                      pass
+                  if intento < 3:
+                      time.sleep(espera)
+              raise ErrorApi(f"sin respuesta de {url}")
+
+
+          def api(ruta):
+              st, cuerpo, _ = _pedir(f"{API}/{ruta}")
+              return st, (json.loads(cuerpo) if st == 200 and cuerpo else None)
+
+
+          def api_paginado(ruta, tope=1000):
+              url, items = f"{API}/{ruta}", []
+              while url and len(items) < tope:
+                  st, cuerpo, cab = _pedir(url)
+                  if st != 200:
+                      raise ErrorApi(f"HTTP {st} en {url}")
+                  items += json.loads(cuerpo)
+                  m = re.search(r'<([^>]+)>;\s*rel="next"', cab.get("Link") or "")
+                  url = m.group(1) if m else None
+              return items
+
+
+          # ---------------------------------------------------- qué cambió
+
+          def es_relevante(ruta):
+              r = ruta.lower()
+              if r.rsplit("/", 1)[-1] in ("action.yml", "action.yaml"):
+                  return True
+              return (r.startswith(".github/workflows/") and r.count("/") == 2
+                      and r.endswith((".yml", ".yaml")))
+
+
+          def es_sensible(ruta):
+              r = ruta.lower()
+              return r == ".github" or r.startswith(".github/") or es_relevante(r)
+
+
+          def shas_del_evento(repo):
+              """(base, head) de lo que el cambio mete en main."""
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
+                  ev = json.load(f)
+              nombre = os.environ["GITHUB_EVENT_NAME"]
+              if nombre == "merge_group":
+                  return ev["merge_group"]["base_sha"], ev["merge_group"]["head_sha"]
+              if nombre != "pull_request":
+                  raise ErrorApi(f"evento no soportado: {nombre}")
+              # GITHUB_SHA es el merge de prueba (refs/pull/N/merge): padres = [punta
+              # de la base, head del PR]. Se exige ese orden; si no, punta de la base
+              # contra head del PR: más estricto (un PR atrasado revisa también lo
+              # que main cambió), nunca más laxo.
+              pr = ev["pull_request"]
+              head = os.environ["GITHUB_SHA"]
+              st, c = api(f"repos/{repo}/git/commits/{head}")
+              if st != 200:
+                  raise ErrorApi(f"no se pudo leer el commit {head[:12]} (HTTP {st})")
+              padres = [p["sha"] for p in c.get("parents", [])]
+              if len(padres) == 2 and padres[1] == pr["head"]["sha"]:
+                  return padres[0], head
+              print("::warning title=verificar-acciones::sin merge de prueba; se compara contra la punta de la base")
+              return pr["base"]["sha"], pr["head"]["sha"]
+
+
+          def entradas(repo, sha):
+              if not sha:
+                  return {}
+              st, d = api(f"repos/{repo}/git/trees/{sha}")
+              if st != 200:
+                  raise ErrorApi(f"no se pudo leer el árbol {sha[:12]} (HTTP {st})")
+              if d.get("truncated"):
+                  raise ErrorApi(f"árbol {sha[:12]} truncado por GitHub")
+              return {e["path"]: e for e in d["tree"]}
+
+
+          def detectar(repo, base, head):
+              """Diff de árboles incremental: baja solo a los directorios que cambiaron.
+
+              Devuelve (cambios, prohibidos): archivos relevantes nuevos o modificados, y
+              enlaces simbólicos o submódulos nuevos o modificados en rutas sensibles.
+              """
+              cambios, prohibidos, nivel = [], [], [("", base, head)]
+              with ThreadPoolExecutor(LOTE) as ex:
+                  while nivel:
+                      leidos = ex.map(lambda t: (t[0], entradas(repo, t[1]), entradas(repo, t[2])), nivel)
+                      nivel = []
+                      for prefijo, eb, eh in leidos:
+                          for nombre, e in eh.items():
+                              ruta, previo = prefijo + nombre, eb.get(nombre)
+                              if previo and previo["sha"] == e["sha"] and previo["mode"] == e["mode"]:
+                                  continue
+                              if e["type"] == "tree":
+                                  nivel.append((ruta + "/", previo["sha"] if previo and previo["type"] == "tree"
+                                                else None, e["sha"]))
+                              elif e["type"] == "commit" or ruta == ".gitmodules":
+                                  # Submódulo en cualquier ruta: `uses: ./vendor/x` con checkout
+                                  # `submodules: true` correría un commit ajeno. Hoy: 0 en la org.
+                                  prohibidos.append((ruta, "submódulo"))
+                              elif e["mode"] == "120000":
+                                  if es_sensible(ruta):
+                                      prohibidos.append((ruta, "enlace simbólico"))
+                              elif e["type"] == "blob" and es_relevante(ruta):
+                                  base_blob = (previo["sha"] if previo and previo["type"] == "blob"
+                                               and previo["mode"] != "120000" else None)
+                                  cambios.append({"ruta": ruta, "base": base_blob, "head": e["sha"]})
+              return sorted(cambios, key=lambda c: c["ruta"]), sorted(prohibidos)
+
+
+          def blob(repo, sha):
+              st, d = api(f"repos/{repo}/git/blobs/{sha}")
+              if st != 200:
+                  raise ErrorApi(f"no se pudo leer el blob {sha[:12]} (HTTP {st})")
+              return base64.b64decode(d["content"]).decode("utf-8")
+
+
+          # ------------------------------------------------ lectura del archivo
+
+          def lineas_nuevas(base_txt, head_txt):
+              a, b = base_txt.splitlines(), head_txt.splitlines()
+              nuevas = set()
+              sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+              for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+                  if tag in ("replace", "insert"):
+                      nuevas.update(range(j1 + 1, j2 + 1))
+              return nuevas
+
+
+          def leer_yaml(texto):
+              """(raíz, error, línea): árbol de nodos YAML SIN construir.
+
+              Como el runner, se lee por tipo de nodo (mapa, lista, escalar) e ignora
+              las etiquetas: `!!omap`, `!!set` o `!!pairs` no esconden un `uses`.
+              Claves duplicadas → error (PyYAML se quedaría con la última).
+              """
+              import yaml
+              try:
+                  raiz = yaml.compose(texto, Loader=yaml.SafeLoader)
+              except yaml.YAMLError as e:
+                  marca = getattr(e, "problem_mark", None)
+                  return None, f"YAML que no se puede leer: {getattr(e, 'problem', None) or e}", (
+                      marca.line + 1 if marca else None)
+              for n in nodos(raiz):
+                  if isinstance(n, yaml.MappingNode):
+                      vistas = set()
+                      for k, _v in n.value:
+                          if not isinstance(k, yaml.ScalarNode):
+                              continue
+                          if k.value == "<<":
+                              return None, "clave de fusión `<<`: no se permite (esconde pasos)", k.start_mark.line + 1
+                          if k.value in vistas:
+                              return None, f"clave duplicada {k.value!r}", k.start_mark.line + 1
+                          vistas.add(k.value)
+              return raiz, None, None
+
+
+          def nodos(raiz):
+              """Todos los nodos, una vez cada uno (los alias apuntan al mismo nodo)."""
+              import yaml
+              vistos, pila = set(), ([raiz] if raiz is not None else [])
+              while pila:
+                  n = pila.pop()
+                  if id(n) in vistos:
+                      continue
+                  vistos.add(id(n))
+                  yield n
+                  if isinstance(n, yaml.MappingNode):
+                      for k, v in n.value:
+                          pila += [k, v]
+                  elif isinstance(n, yaml.SequenceNode):
+                      pila += n.value
+
+
+          def campos(n):
+              import yaml
+              if not isinstance(n, yaml.MappingNode):
+                  return {}
+              return {k.value: v for k, v in n.value if isinstance(k, yaml.ScalarNode)}
+
+
+          def escalar(n):
+              import yaml
+              return n.value if isinstance(n, yaml.ScalarNode) else None
+
+
+          def usos(raiz):
+              """Valor de toda clave `uses`, en cualquier nivel (None si no es escalar)."""
+              import yaml
+              return [escalar(v) for n in nodos(raiz) if isinstance(n, yaml.MappingNode)
+                      for k, v in n.value if escalar(k) == "uses"]
+
+
+          def checkouts(raiz):
+              """{(repositorio, ref)} de todo `actions/checkout` que elige otro árbol.
+
+              Un checkout de otro repo o ref seguido de `uses: ./…` (en el mismo paso
+              de lista, en otra acción compuesta o con un path en expresión) ejecuta
+              un action.yml fuera de toda clave `uses`. Se verifica el checkout mismo,
+              dondequiera que esté. Inputs como el runner: nombre sin mayúsculas,
+              valor recortado; nombres repetidos → no verificable.
+              """
+              out = set()
+              for n in nodos(raiz):
+                  c = campos(n)
+                  m = USES_RE.fullmatch((escalar(c.get("uses")) or "").strip())
+                  # Dueño y repo, con cualquier subruta (`actions/checkout/.@sha` es el mismo).
+                  if not m or f"{m.group(1)}/{m.group(2)}".lower() != "actions/checkout":
+                      continue
+                  w = campos(c.get("with"))
+                  entradas_ = {k.lower(): (escalar(v) or "").strip() for k, v in w.items()}
+                  if len(entradas_) != len(w):
+                      out.add(("(inputs repetidos)", ""))
+                      continue
+                  servidor = entradas_.get("github-server-url", "")
+                  if servidor and not re.fullmatch(r"https://github\.com/?|\$\{\{\s*github\.server_url\s*\}\}", servidor):
+                      out.add((f"(servidor {servidor})", ""))
+                      continue
+                  repo_, ref = entradas_.get("repository", ""), entradas_.get("ref", "")
+                  if repo_ or ref:
+                      out.add((repo_, ref))
+              return out
+
+
+          # Expresión que solo lee contextos, unidos por `||` (sin constantes), p. ej.
+          # github.event.inputs.ref || github.sha, o steps.plan.outputs.sha.
+          # Ojo: ningún `$` seguido de `{{` literal en este script: GitHub lo evaluaría.
+          CTX = r"(?:github|inputs|steps|needs|matrix|env|vars)\.[A-Za-z0-9_.-]+"
+          REF_CALCULADA = re.compile(r"\$\{\{\s*" + CTX + r"(?:\s*\|\|\s*" + CTX + r")*\s*\}\}")
+          RAMA_DEFECTO = ("", "main", "refs/heads/main")
+
+
+          def verificar_checkout(repo_, ref, verif):
+              """Motivo de rojo, o None.
+
+              - SHA literal (sin distinguir mayúsculas): alcanzable, en cualquier repo
+                (un commit de un fork del propio repo también resuelve).
+              - Propio repo: `main` o una ref calculada en ejecución (solo contextos):
+                lo mismo que un `run:`, fuera de este check. Otra rama, `refs/pull/N`,
+                tag o expresión constante → rojo: elige un árbol que nadie verificó.
+              - Repo de la org: `main` (o sin ref).
+              - Otro repo: nombre literal y SHA. Lo demás → rojo.
+              """
+              if repo_.startswith("("):
+                  return f"checkout no verificable: {repo_.strip('()')}"
+              propio = os.environ.get("GITHUB_REPOSITORY", "")
+              r = re.sub(r"\$\{\{\s*github\.repository_owner\s*\}\}", propio.split("/")[0], repo_)
+              if re.fullmatch(r"\$\{\{\s*github\.repository\s*\}\}", r):
+                  r = propio
+              literal = re.fullmatch(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)", r)
+              sha = ref.lower() if re.fullmatch(r"[0-9a-fA-F]{40}", ref) else None
+              if not r or r.lower() == propio.lower():
+                  if sha and propio:
+                      return verif.alcanzable(*propio.split("/", 1), sha)
+                  if ref in RAMA_DEFECTO or REF_CALCULADA.fullmatch(ref):
+                      return None
+                  return (f"checkout del propio repo con `ref: {ref}`: rama, PR o tag que no pasó por "
+                          "este check; usa main, un SHA alcanzable o una ref del evento")
+              dueno = r.split("/", 1)[0]
+              ref = sha or ref
+              if sha:
+                  if not literal:
+                      return f"checkout de `{repo_}` con SHA: repositorio no verificable; escríbelo literal"
+                  return verif.alcanzable(literal.group(1), literal.group(2), ref)
+              if dueno.lower() == ORG and ref in RAMA_DEFECTO:
+                  return None
+              if not literal:
+                  return f"checkout de `{repo_}`: repositorio no verificable; escríbelo literal"
+              return f"checkout de {r} sin SHA fijo (`ref: {ref or 'por defecto'}`): fija `ref:` a un SHA completo"
+
+
+          def _buscar(uso, linea):
+              return re.search(r"(?<![\w./-])" + re.escape(uso) + r"(?![\w./@-])", linea)
+
+
+          def aparece(uso, linea):
+              return _buscar(uso, linea) is not None
+
+
+          def comentario(linea, uso):
+              m = _buscar(uso, linea)
+              resto = linea[m.end():] if m else ""
+              c = re.search(r"(?:^|\s)#\s*(.*)$", resto.lstrip("'\""))
+              return c.group(1).strip() if c else ""
+
+
+          # ------------------------------------------------------- verificación
+
+          class Verificador:
+              def __init__(self):
+                  self._alcance = {}
+                  self._tags = {}
+                  self._lista_tags = {}
+
+              def contiene(self, repo, rama, sha):
+                  st, d = api(f"repos/{repo}/compare/{urllib.parse.quote(rama, safe='/')}...{sha}?per_page=1")
+                  return st == 200 and d.get("status") in ("behind", "identical")
+
+              def alcanzable(self, dueno, repo, sha):
+                  clave = (dueno.lower(), repo.lower(), sha)
+                  if clave not in self._alcance:
+                      self._alcance[clave] = self._alcanzable(dueno, repo, sha)
+                  return self._alcance[clave]
+
+              def _alcanzable(self, dueno, repo, sha):
+                  st, info = api(f"repos/{dueno}/{repo}")
+                  if st != 200:
+                      return f"no se pudo leer el repo {dueno}/{repo} (HTTP {st}): sin verificar no entra"
+                  full, rama_def = info["full_name"], info["default_branch"]
+                  st, _ = api(f"repos/{full}/commits/{sha}")
+                  if st != 200:
+                      return f"el commit {sha[:12]} no existe en {full}"
+                  if self.contiene(full, rama_def, sha):
+                      return None
+                  if info["owner"]["login"].lower() == ORG:
+                      return (f"reusable propio fuera de `{rama_def}`: solo entra código ya "
+                              f"mergeado en {full}")
+                  ramas = [r for r in api_paginado(f"repos/{full}/branches?per_page=100")
+                           if r["name"] != rama_def]
+                  if any(r["commit"]["sha"] == sha for r in ramas):
+                      return None
+                  ramas.sort(key=lambda r: (
+                      0 if re.match(r"(releases?[/-]|v\d)", r["name"]) else
+                      1 if r["name"] in ("main", "master", "develop") else 2, r["name"]))
+                  revisar = ramas[:MAX_RAMAS]
+                  with ThreadPoolExecutor(LOTE) as ex:
+                      for i in range(0, len(revisar), LOTE):
+                          lote = revisar[i:i + LOTE]
+                          if any(ex.map(lambda r: self.contiene(full, r["name"], sha), lote)):
+                              return None
+                  if len(ramas) > MAX_RAMAS:
+                      return (f"búsqueda incompleta: {full} tiene {len(ramas)}+ ramas y el commit "
+                              f"{sha[:12]} no está en las {len(revisar)} revisadas; pide revisión a un owner")
+                  return (f"el commit {sha[:12]} no está en ninguna rama de {full}: "
+                          f"commit de un fork (impostor) o tag movido fuera de la historia")
+
+              def tag_commit(self, full, tag):
+                  clave = (full.lower(), tag)
+                  if clave in self._tags:
+                      return self._tags[clave]
+                  res = None
+                  st, d = api(f"repos/{full}/git/ref/tags/{urllib.parse.quote(tag)}")
+                  obj = d["object"] if st == 200 else None
+                  for _ in range(5):
+                      if not obj:
+                          break
+                      if obj["type"] == "commit":
+                          res = obj["sha"]
+                          break
+                      if obj["type"] != "tag":
+                          break
+                      st, d = api(f"repos/{full}/git/tags/{obj['sha']}")
+                      obj = d["object"] if st == 200 else None
+                  self._tags[clave] = res
+                  return res
+
+              def tags_de(self, full):
+                  if full.lower() not in self._lista_tags:
+                      self._lista_tags[full.lower()] = {
+                          t["name"]: t["commit"]["sha"] for t in api_paginado(f"repos/{full}/tags?per_page=100")}
+                  return self._lista_tags[full.lower()]
+
+              def version(self, dueno, repo, sha, texto):
+                  if dueno.lower() == ORG:
+                      return None
+                  m = VER_RE.search(texto or "")
+                  if not m:
+                      return ("sin versión en el comentario: escribe `# vX.Y.Z` con el tag "
+                              "que apunta a ese SHA")
+                  v = m.group(1)
+                  full = f"{dueno}/{repo}"
+                  existe = None
+                  for tag in (v, v[1:] if v.startswith("v") else "v" + v):
+                      t = self.tag_commit(full, tag)
+                      if t == sha:
+                          return None
+                      if t is not None and existe is None:
+                          existe = (tag, t)
+                  # `# v7` (solo mayor): vale si algún v7.x apunta a ese SHA; el tag
+                  # flotante v7 se mueve con cada release.
+                  if re.fullmatch(r"v?\d+", v):
+                      familia = (v if v.startswith("v") else "v" + v) + "."
+                      if any(n.startswith((familia, familia[1:])) and s == sha
+                             for n, s in self.tags_de(full).items()):
+                          return None
+                  if existe:
+                      return (f"el comentario dice {existe[0]}, pero {existe[0]} apunta a "
+                              f"{existe[1][:12]}, no a {sha[:12]}")
+                  return f"el comentario dice {v}, pero ese tag no existe en {full}"
+
+              def revisar_uso(self, ruta, uso, lineas):
+                  n0 = lineas[0][0]
+                  # `$/` = acción local en la sintaxis de los lockfiles (`gh actions-lock`).
+                  if uso.startswith(("./", "$/")):
+                      return []
+                  if uso.startswith("docker://"):
+                      if "@sha256:" in uso:
+                          return []
+                      return [hallazgo("aviso", ruta, n0, uso,
+                                       "imagen docker sin digest @sha256: (fuera de este check)")]
+                  m = USES_RE.fullmatch(uso)
+                  if not m:
+                      return [hallazgo("error", ruta, n0, uso, "forma de `uses` no reconocida")]
+                  dueno, repo, sub, ref = m.groups()
+                  if any(s in (".", "..", "") for s in sub.split("/")[1:]):
+                      return [hallazgo("error", ruta, n0, uso, "subruta con `.`, `..` o `//`: escríbela canónica")]
+                  if not SHA_RE.fullmatch(ref):
+                      return [hallazgo("error", ruta, n0, uso,
+                                       f"no está fijado por SHA completo (`@{ref}`)")]
+                  out = []
+                  motivo = self.alcanzable(dueno, repo, ref)
+                  if motivo:
+                      out.append(hallazgo("error", ruta, n0, uso, motivo))
+                  for n, linea in lineas:
+                      motivo = self.version(dueno, repo, ref, comentario(linea, uso))
+                      if motivo:
+                          out.append(hallazgo("error", ruta, n, uso, motivo))
+                  return out
+
+
+          def hallazgo(nivel, ruta, linea, uso, motivo):
+              return {"nivel": nivel, "ruta": ruta, "linea": linea, "uso": uso, "motivo": motivo}
+
+
+          def revisar_archivo(ruta, base_txt, head_txt, verif):
+              """(hallazgos, líneas donde aparece algún par nuevo)."""
+              import yaml
+              raiz, error, linea = leer_yaml(head_txt)
+              if error:
+                  return [hallazgo("error", ruta, linea, None, error)], set()
+              if not isinstance(raiz, yaml.MappingNode):
+                  # Puntero de Git LFS, texto suelto o vacío: el manifiesto real no está
+                  # aquí y no se puede verificar (checkout con `lfs: true` lo traería).
+                  lfs = head_txt.startswith("version https://git-lfs.github.com/spec/")
+                  return [hallazgo("error", ruta, 1, None,
+                                   "puntero de Git LFS: el contenido real queda fuera de la verificación"
+                                   if lfs else "no es un workflow ni una acción (la raíz no es un mapa)")], set()
+              raiz_base = leer_yaml(base_txt)[0] if base_txt else None
+              previos = {u for u in usos(raiz_base) if isinstance(u, str)}
+              lineas = head_txt.splitlines()
+              nuevas = sorted(lineas_nuevas(base_txt, head_txt))
+              out, vistos, de_pares_nuevos = [], set(), set()
+              for repo_, ref in sorted(checkouts(raiz) - checkouts(raiz_base)):
+                  motivo = verificar_checkout(repo_, ref, verif)
+                  if motivo:
+                      clave = ref or repo_
+                      n = next((i for i in nuevas if clave and clave in lineas[i - 1]), None)
+                      out.append(hallazgo("error", ruta, n, f"actions/checkout · {repo_ or 'propio'}@{ref or '-'}",
+                                          motivo))
+              for uso in usos(raiz):
+                  if not isinstance(uso, str):
+                      out.append(hallazgo("error", ruta, None, None, "`uses` que no es texto"))
+                      continue
+                  if uso in previos or uso in vistos:
+                      continue
+                  vistos.add(uso)
+                  donde = [(n, lineas[n - 1]) for n in nuevas if aparece(uso, lineas[n - 1])]
+                  if not donde:
+                      out.append(hallazgo("error", ruta, None, uso,
+                                          "uso nuevo que no aparece literal en una línea añadida "
+                                          "(escape, alias o multilínea): escríbelo en una sola línea"))
+                      continue
+                  de_pares_nuevos.update(n for n, _ in donde)
+                  out += verif.revisar_uso(ruta, uso, donde)
+              return out, de_pares_nuevos
+
+
+          # ------------------------------------------------------------- zizmor
+
+          def instalar():
+              subprocess.run([sys.executable, "-m", "venv", VENV], check=True)
+              req = os.path.join(TMP, "verificar-acciones-requisitos.txt")
+              with open(req, "w", encoding="utf-8") as f:
+                  f.write(REQUISITOS)
+              subprocess.run([os.path.join(VENV, "bin", "pip"), "install", "--quiet",
+                              "--disable-pip-version-check", "--no-deps", "--only-binary", ":all:",
+                              "--require-hashes", "-r", req], check=True, timeout=300)
+              sys.path.insert(0, glob.glob(os.path.join(VENV, "lib", "python3*", "site-packages"))[0])
+
+
+          def correr_zizmor(archivo):
+              """Lista de (auditoría, fila_ini, fila_fin, descripción), o None si zizmor falla."""
+              try:
+                  r = subprocess.run(
+                      [os.path.join(VENV, "bin", "zizmor"), "--no-config", "--no-ignores", "--no-progress",
+                       "--no-exit-codes", "--format", "json",
+                       "--cache-dir", os.path.join(TMP, "verificar-acciones-zizmor-cache"), archivo],
+                      capture_output=True, text=True, timeout=120)
+                  if r.returncode != 0:
+                      return None
+                  hallados = json.loads(r.stdout or "[]")
+              except (subprocess.TimeoutExpired, ValueError):
+                  return None
+              out = []
+              for f in hallados:
+                  if f.get("ident") not in ("impostor-commit", "ref-version-mismatch"):
+                      continue
+                  for loc in f.get("locations", []):
+                      if (loc.get("symbolic") or {}).get("kind", "Primary") != "Primary":
+                          continue
+                      c = loc["concrete"]["location"]
+                      out.append((f["ident"], c["start_point"]["row"] + 1,
+                                  c["end_point"]["row"] + 1, f.get("desc", "")))
+              return out
+
+
+          def revisar_zizmor(ruta, head_txt, carpeta, de_pares_nuevos):
+              destino = os.path.join(carpeta, ruta)
+              os.makedirs(os.path.dirname(destino), exist_ok=True)
+              with open(destino, "w", encoding="utf-8") as f:
+                  f.write(head_txt)
+              res = correr_zizmor(destino)
+              if res is None:
+                  return [hallazgo("aviso", ruta, None, None,
+                                   "zizmor no pudo auditar el archivo; la verificación propia lo cubrió")]
+              out = []
+              for ident, ini, fin, desc in res:
+                  nuevo = any(n in de_pares_nuevos for n in range(ini, fin + 1))
+                  bloquea = nuevo and ident == "impostor-commit"
+                  nota = "" if nuevo else " (par que ya estaba en main)"
+                  out.append(hallazgo("error" if bloquea else "aviso", ruta, ini, None,
+                                      f"zizmor {ident}: {desc}{nota}"))
+              return out
+
+
+          # ------------------------------------------------------------- salida
+
+          def _dato(t):
+              return str(t).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def _prop(t):
+              return _dato(t).replace(":", "%3A").replace(",", "%2C")
+
+
+          def _celda(t):
+              return re.sub(r"[`|\r\n]", " ", str(t))
+
+
+          def informar(hallazgos, n_archivos):
+              for h in hallazgos:
+                  tipo = "error" if h["nivel"] == "error" else "warning"
+                  props = f"file={_prop(h['ruta'])}" + (f",line={h['linea']}" if h["linea"] else "")
+                  texto = (f"`{_celda(h['uso'])}`: " if h["uso"] else "") + h["motivo"]
+                  print(f"::{tipo} {props},title=verificar-acciones::{_dato(texto)}")
+              errores = sum(h["nivel"] == "error" for h in hallazgos)
+              filas = [f"| {'❌' if h['nivel'] == 'error' else '⚠️'} | {_celda(h['ruta'])}:{h['linea'] or '-'} "
+                       f"| `{_celda(h['uso'] or '-')}` | {_celda(h['motivo'])} |" for h in hallazgos]
+              lineas = [f"## verificar-acciones — {'ROJO' if errores else 'VERDE'}", "",
+                        f"Archivos revisados: {n_archivos} · errores: {errores} · "
+                        f"avisos: {len(hallazgos) - errores}", ""]
+              if filas:
+                  lineas += ["| | Archivo | uses | Motivo |", "|---|---|---|---|", *filas]
+              resumen("\n".join(lineas))
+              return errores
+
+
+          def resumen(texto):
+              # Ninguna línea empieza con `::`: el texto del PR va en celdas `| … |`.
+              print(texto)
+              destino = os.environ.get("GITHUB_STEP_SUMMARY")
+              if destino:
+                  with open(destino, "a", encoding="utf-8") as f:
+                      f.write(texto + "\n")
+
+
+          def main():
+              repo = os.environ["GITHUB_REPOSITORY"]
+              try:
+                  base, head = shas_del_evento(repo)
+                  print(f"base {base} · head {head}")
+                  cambios, prohibidos = detectar(repo, base, head)
+                  hallazgos = [hallazgo("error", r, None, None,
+                                        f"{tipo} en una ruta de workflows o acciones: no se permite "
+                                        "(el contenido real queda fuera de la verificación)")
+                               for r, tipo in prohibidos]
+                  if not cambios:
+                      if not hallazgos:
+                          resumen("## verificar-acciones — VERDE\n\nSin cambios en workflows ni en action.yml.")
+                          return 0
+                      return 1 if informar(hallazgos, 0) else 0
+                  instalar()
+                  verif = Verificador()
+                  with tempfile.TemporaryDirectory() as carpeta:
+                      for c in cambios:
+                          try:
+                              head_txt = blob(repo, c["head"])
+                              base_txt = blob(repo, c["base"]) if c["base"] else ""
+                          except UnicodeDecodeError:
+                              hallazgos.append(hallazgo("error", c["ruta"], None, None, "archivo que no es UTF-8"))
+                              continue
+                          propios, de_pares_nuevos = revisar_archivo(c["ruta"], base_txt, head_txt, verif)
+                          hallazgos += propios
+                          hallazgos += revisar_zizmor(c["ruta"], head_txt, carpeta, de_pares_nuevos)
+                  return 1 if informar(hallazgos, len(cambios)) else 0
+              except (ErrorApi, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                  print(f"::error title=verificar-acciones::{_dato(f'no se pudo verificar, sin verificar no entra: {e}')}")
+                  return 1
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
