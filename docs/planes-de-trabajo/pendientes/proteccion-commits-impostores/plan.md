@@ -44,9 +44,9 @@
 | F2 | Ruleset de org en Evaluate | 25-nov | Completada · ruleset 28092239 |
 | F3 | PRs de prueba + Active + prueba de bloqueo | 25-nov | Completada · active 16:19; ensayo-identidad-app#11 BLOCKED, #12 CLEAN |
 | F4 | Defensa 2: `/cambios-criticos` semanal con verificación upstream | 25-nov | Completada · patrón 8; texto con llave (registro #174) |
-| F5.1 | Lockfiles: medición en seco por repo (`gh actions-lock --no-fix`) | 26-nov | Pendiente |
-| F5.2 | Política «Require lockfile» en Evaluate (org) | 27-nov | Pendiente |
-| F5.3 | Onboarding: `actions.lock` por repo, `.github` primero | 1-dic a 5-dic | Pendiente |
+| F5.1 | Lockfiles: medición en seco por repo (`gh actions-lock --no-fix`) | 26-nov | Completada · informe SHP3 (`scratch/maestra-28jul-coord/reportes/SHP3-lockfiles-en-seco.md`) |
+| F5.2 | Política «Require lockfile» en Evaluate (org) | 27-nov | Completada · política de Actions 18025, Evaluate, 18 repos por `repository_id`; informe SHP4 |
+| F5.3 | Onboarding: `actions.lock` por repo, `.github` primero; 18 repos | 1-dic a 5-dic | Pendiente · antes, decisión de David sobre el choque A (SHP4 § «Decisión F5.3 · choque A») |
 | F5.4 | «Require lockfile» a Active | 12-dic | Pendiente |
 
 Archivos:
@@ -59,7 +59,16 @@ Cabos sueltos (25-nov):
 - Ruleset: `~ALL` menos direccion-comercial, empleados-virtuales, control-calidad (D-3586 decisión 1).
 - PRs abiertos antes del ruleset (D-3586 decisión 2): 19 reabiertos con el chequeo en verde. Sin chequeo hasta su próxima actualización: 9 con conflictos, 3 apilados sobre otra rama (no aplica), 2 de Dependabot (adm#5948, landing#585: un push o `@dependabot rebase`).
 - Cambiar el check: merge en `.github` + mover el `sha` del ruleset 28092239 (owner).
-- Siguiente sesión: arrancar por F5.1.
+
+Cabos sueltos (27-nov):
+- Política 18025 `P-1047 require lockfile`: Evaluate, solo «Require lockfile»; `actions/permissions` y rulesets sin cambio.
+- Alcance 18, no 14: P-536 añadió `secret-scan.yml` el 27-nov a control-calidad, direccion-comercial, empleados-virtuales, owners-control. Los 4 entran en F5.3.
+- Desvío aceptado: la interfaz guarda «All workflows» como `workflow_path.include: ["~ALL"]` (esquema: todos los workflows). Repos sin `~ALL`.
+- URLs: políticas `organizations/FaroNovaCorp/settings/actions/rules`; insights `…/settings/actions/rules/insights`.
+- Policy insights: cada run de los 18 sale «Evaluate · Would block» con el archivo del workflow. Sin ver aún: `pull_request`, `merge_group`, `schedule`, Dependabot.
+- Choque A (`verificar-acciones` vs `@vX` de `gh actions-lock`): decide David antes del 1-dic; opciones y recomendación en `scratch/maestra-28jul-coord/reportes/SHP4-lockfile-evaluate.md`.
+- Deshacer F5.2: Disabled en la página, o `gh api -X DELETE orgs/FaroNovaCorp/actions/policies/18025`.
+- Siguiente sesión: arrancar por la decisión del choque A, luego F5.3.
 
 ## Contexto
 
@@ -127,7 +136,7 @@ Secundarios:
 ### F5 · Lockfiles
 
 - F5.1 · 26-nov · `gh actions-lock --no-fix` en cada repo, en seco: errores, acciones locales `./`, reusables.
-- F5.2 · 27-nov · «Require lockfile» en Evaluate, org, todos los repos (interfaz: Settings → Actions → Policies; navegador con el aviso de David).
+- F5.2 · 27-nov · «Require lockfile» en Evaluate, org, los 18 repos activos con workflows, por lista explícita (interfaz: Settings → Actions → Policies; navegador con el aviso de David).
 - F5.3 · 1-dic a 5-dic · `actions.lock` por repo; `.github` primero (sus reusables deben estar onboarded antes que los que los llaman). Dependabot regenera las entradas.
 - F5.4 · 12-dic · Active, tras 7 días de Policy insights sin «would block».
 
