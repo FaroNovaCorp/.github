@@ -13,8 +13,12 @@ name: verificar-acciones
 # - Mide lo que el PR mete en main: merge de prueba contra su primer padre
 #   (PR) o base de la cola (merge_group). Un PR atrasado no hereda como suyos
 #   los cambios que main hizo en sus workflows.
-# - Bloquea solo pares acción@SHA nuevos. Lo que ya estaba en main avisa aquí
-#   y lo detecta la revisión semanal de /cambios-criticos (patrón 8).
+# - Bloquea solo `uses` nuevos (y entradas de `actions.lock` nuevas, cambiadas
+#   o que un workflow empieza a usar). Lo que ya estaba en main no bloquea; lo
+#   mira la revisión semanal de /cambios-criticos (patrón 8), que hoy lee solo
+#   pines por SHA, no `actions.lock`.
+# - `actions.lock` es código: el runner ejecuta el `commit` de cada entrada, no
+#   el tag de la línea. Un cambio solo del lockfile también se verifica.
 # - Nunca hace checkout ni ejecuta código del PR: lee el diff por API.
 # - Sin `concurrency`/`cancel-in-progress`: la doc de rulesets lo desaconseja.
 # - Límites: reusables de OTRO repo privado de la org dan rojo (el GITHUB_TOKEN
@@ -23,7 +27,13 @@ name: verificar-acciones
 #   lockfiles (plan, F5). No mira código en `run:` ni acciones que escriben un
 #   action.yml en el workspace (download-artifact, cache) antes de un
 #   `uses: ./…`: revisión del PR y /cambios-criticos. «Repo de la org en main»
-#   incluye los 4 repos sin flujo de PR, que quedan fuera del ruleset.
+#   incluye los 4 repos sin flujo de PR, que quedan fuera del ruleset. No
+#   compara el grafo transitivo del lockfile con el action.yml de cada acción
+#   (eso lo hace `gh actions-lock --verify`). Tampoco exige entrada para un
+#   paso por SHA de un workflow incorporado: el código lo fija la línea; que el
+#   lockfile esté completo lo comprueba `--verify`. Una acción de terceros que por
+#   dentro use una rama, o un commit que ya no está en ninguna rama, da rojo
+#   (27-nov: 0 casos en las entradas de los 18 repos).
 # Plan: docs/planes-de-trabajo/pendientes/proteccion-commits-impostores/plan.md
 # Tests: python3 -m unittest discover -s .github/tests -p 'test_*.py'
 
@@ -47,8 +57,9 @@ jobs:
         run: |
           """Verifica que todo `uses:` nuevo salga de una rama del repo dueño.
 
-          Por cada par acción@SHA que el cambio agrega a un workflow o action.yml:
-          - SHA completo de 40 caracteres.
+          Por cada par acción@ref que el cambio agrega a un workflow o action.yml:
+          - SHA completo de 40 caracteres, o un tag que `actions.lock` respalde
+            (abajo).
           - El commit existe en el repo dueño y es alcanzable desde una RAMA
             suya (rama por defecto primero, luego releases, luego el resto).
             Solo-fork (impostor) o solo-tag (tag movido fuera de la historia)
@@ -71,8 +82,26 @@ jobs:
           - zizmor (--no-config --no-ignores): impostor-commit en la línea de un
             par nuevo → rojo; ref-version-mismatch, líneas previas o zizmor que
             no lee el archivo → aviso (la verificación propia es la autoridad).
+
+          `.github/workflows/actions.lock` (v0.0.3):
+          - `uses: dueño/repo@vX` pasa solo si es un paso de un job y el lockfile
+            tiene su entrada para ese workflow. La entrada y todo lo que arrastra
+            (`uses`): `commit` de 40 con el criterio de arriba (rama del dueño);
+            tag de versión que apunta a ese commit (`@vN`: algún `vN.x`);
+            `owner_id`/`repo_id` del repo. Clave por SHA: `commit` es ese SHA.
+            Sin entrada → rojo. Reusables (`jobs.<id>.uses`) y action.yml: el
+            lockfile no los fija; exigen SHA.
+          - Lockfile cambiado, aunque ningún workflow cambie: se verifica cada
+            entrada nueva, cambiada o que un workflow empieza a usar, con lo que
+            arrastra. Quitar la entrada de un `uses` con tag que sigue → rojo.
+          - Un par por SHA nuevo con entrada en el lockfile: también se verifica
+            lo que la entrada arrastra.
+          - Formato cerrado (lo que no se entiende no entra): ASCII sin anclas,
+            alias, etiquetas ni barras invertidas; solo campos conocidos (sin
+            `hostname`); grafo sin entradas colgando.
           """
           import base64
+          import collections
           import difflib
           import glob
           import http.client
@@ -99,6 +128,17 @@ jobs:
           VER_RE = re.compile(
               r"(?:^|[\s=@(:])((?:v\d+(?:\.\d+)*|\d+(?:\.\d+)+)(?:-[0-9A-Za-z][0-9A-Za-z.]*)?)(?![\w.-])"
           )
+          LOCK_RUTA = ".github/workflows/actions.lock"
+          LOCK_VERSION = "v0.0.3"
+          LOCK_MAX = 1 << 20
+          # SHA completo (sha1 o sha256, cualquier caja): nunca entra por lockfile.
+          SHA_COMPLETO = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
+          PIN_RE = re.compile(
+              r"([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)@([A-Za-z0-9._+/-]+)")
+          REUSABLE_RE = re.compile(r"/\.github/workflows/[^/]+\.ya?ml")
+          # Ref que un lockfile puede respaldar: tag de versión (`v4`, `v7.0.1`, `1.2.3-rc.1`).
+          TAG_RE = re.compile(r"v?\d+(?:\.\d+)*(?:-[0-9A-Za-z][0-9A-Za-z.]*)?")
+          Entrada = collections.namedtuple("Entrada", "ref commit owner_id repo_id uses")
           MAX_RAMAS = 300
           LOTE = 8
           TMP = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
@@ -171,12 +211,16 @@ jobs:
 
           # ---------------------------------------------------- qué cambió
 
-          def es_relevante(ruta):
+          def es_workflow(ruta):
               r = ruta.lower()
-              if r.rsplit("/", 1)[-1] in ("action.yml", "action.yaml"):
-                  return True
               return (r.startswith(".github/workflows/") and r.count("/") == 2
                       and r.endswith((".yml", ".yaml")))
+
+
+          def es_relevante(ruta):
+              if ruta.lower().rsplit("/", 1)[-1] in ("action.yml", "action.yaml"):
+                  return True
+              return es_workflow(ruta)
 
 
           def es_sensible(ruta):
@@ -251,6 +295,22 @@ jobs:
                                                and previo["mode"] != "120000" else None)
                                   cambios.append({"ruta": ruta, "base": base_blob, "head": e["sha"]})
               return sorted(cambios, key=lambda c: c["ruta"]), sorted(prohibidos)
+
+
+          def workflows_en(repo, commit):
+              """{ruta: sha del blob} de los archivos normales de `.github/workflows`.
+
+              Incluye `actions.lock`. Aparte de `detectar`, que solo ve lo nuevo o
+              modificado: un lockfile borrado también cambia lo que corre.
+              """
+              nivel = entradas(repo, commit)
+              for parte in (".github", "workflows"):
+                  e = nivel.get(parte)
+                  if not e or e["type"] != "tree":
+                      return {}
+                  nivel = entradas(repo, e["sha"])
+              return {f".github/workflows/{nombre}": e["sha"] for nombre, e in nivel.items()
+                      if e["type"] == "blob" and e["mode"] != "120000"}
 
 
           def blob(repo, sha):
@@ -334,6 +394,25 @@ jobs:
               import yaml
               return [escalar(v) for n in nodos(raiz) if isinstance(n, yaml.MappingNode)
                       for k, v in n.value if escalar(k) == "uses"]
+
+
+          def usos_fuera_de_pasos(raiz):
+              """Valores de `uses` que aparecen en algún sitio que NO es un paso de un job.
+
+              El lockfile solo fija pasos: un `jobs.<id>.uses` con tag resuelve el
+              tag en vivo aunque el lockfile tenga una entrada con ese nombre.
+              """
+              import yaml
+              jobs = list(campos(campos(raiz).get("jobs")).values())
+              pasos = set()
+              for job in jobs:
+                  lista = campos(job).get("steps")
+                  if isinstance(lista, yaml.SequenceNode):
+                      pasos.update(map(id, lista.value))
+              pasos -= set(map(id, jobs))
+              return {escalar(v) for n in nodos(raiz)
+                      if isinstance(n, yaml.MappingNode) and id(n) not in pasos
+                      for k, v in n.value if escalar(k) == "uses"}
 
 
           def checkouts(raiz):
@@ -429,6 +508,170 @@ jobs:
               return c.group(1).strip() if c else ""
 
 
+          # ------------------------------------------------------- actions.lock
+
+          class ErrorLock(Exception):
+              def __init__(self, motivo, linea=None):
+                  super().__init__(motivo)
+                  self.linea = linea
+
+
+          def pin_canonico(texto):
+              """`dueño/repo@ref` → clave del lockfile (dueño/repo en minúscula), o None."""
+              m = PIN_RE.fullmatch(texto or "")
+              if not m or m.group(2) in (".", ".."):
+                  return None
+              return f"{m.group(1).lower()}/{m.group(2).lower()}@{m.group(3)}"
+
+
+          def es_reusable(subruta):
+              """Llamada a un workflow y no a una acción. La regla de GitHub: un YAML
+              directo bajo `.github/workflows/`. Un directorio de acción puede
+              llamarse `x.yml`: ese es una acción."""
+              return REUSABLE_RE.fullmatch(subruta) is not None
+
+
+          def pin_de_uso(uso):
+              """Pin de un `uses` sin SHA completo (la subruta no es parte del pin), o None."""
+              m = USES_RE.fullmatch(uso)
+              if not m or SHA_COMPLETO.fullmatch(m.group(4)):
+                  return None
+              return pin_canonico(f"{m.group(1)}/{m.group(2)}@{m.group(4)}")
+
+
+          def _sin_trucos(texto):
+              """Cierra lo que dos lectores de YAML podrían entender distinto."""
+              import yaml
+              if len(texto) > LOCK_MAX:
+                  raise ErrorLock("supera 1 MiB")
+              m = re.search(r"[^\n -~]|\\", texto)
+              if m:
+                  raise ErrorLock("solo ASCII imprimible: sin tabuladores, retornos de carro ni barras invertidas",
+                                  texto.count("\n", 0, m.start()) + 1)
+              prohibidos = (yaml.AnchorToken, yaml.AliasToken, yaml.TagToken, yaml.DirectiveToken,
+                            yaml.DocumentStartToken, yaml.DocumentEndToken)
+              try:
+                  for t in yaml.scan(texto, Loader=yaml.SafeLoader):
+                      if isinstance(t, prohibidos) or getattr(t, "style", None) in ("|", ">"):
+                          raise ErrorLock("anclas, alias, etiquetas, directivas, marcas de documento y textos "
+                                          "en bloque no se permiten", t.start_mark.line + 1)
+              except yaml.YAMLError as e:
+                  raise ErrorLock(f"YAML que no se puede leer: {getattr(e, 'problem', None) or e}") from None
+
+
+          def _mapa(n, que, permitidas=None):
+              """{clave: (línea, nodo)} de un mapa con claves de texto (y solo las permitidas)."""
+              import yaml
+              if not isinstance(n, yaml.MappingNode) or not all(
+                      isinstance(k, yaml.ScalarNode) for k, _v in n.value):
+                  raise ErrorLock(f"{que}: se esperaba un mapa con claves de texto",
+                                  n.start_mark.line + 1 if n is not None else None)
+              out = {k.value: (k.start_mark.line + 1, v) for k, v in n.value}
+              if permitidas is not None:
+                  for clave, (linea, _v) in out.items():
+                      if clave not in permitidas:
+                          raise ErrorLock(f"{que}: campo desconocido `{clave}`", linea)
+              return out
+
+
+          def _texto(n, que):
+              import yaml
+              if not isinstance(n, yaml.ScalarNode) or not n.value:
+                  raise ErrorLock(f"{que}: se esperaba un texto", n.start_mark.line + 1)
+              return n.value
+
+
+          def _pines(n, que):
+              import yaml
+              if not isinstance(n, yaml.SequenceNode):
+                  raise ErrorLock(f"{que}: se esperaba una lista", n.start_mark.line + 1)
+              out = set()
+              for item in n.value:
+                  pin = pin_canonico(_texto(item, que))
+                  if pin is None:
+                      raise ErrorLock(f"{que}: `{item.value}` no es `dueño/repo@ref`", item.start_mark.line + 1)
+                  out.add(pin)
+              return tuple(sorted(out))
+
+
+          def _entrada(pin, nodo, linea):
+              import yaml
+              obligatorios = ("ref", "commit", "owner_id", "repo_id")
+              c = {k: v for k, (_n, v) in _mapa(nodo, pin, (*obligatorios, "uses")).items()}
+              faltan = [k for k in obligatorios if k not in c]
+              if faltan:
+                  raise ErrorLock(f"{pin}: falta `{faltan[0]}`", linea)
+              ref = _texto(c["ref"], f"{pin}.ref")
+              commit = re.fullmatch(r"sha1-([0-9a-f]{40})", _texto(c["commit"], f"{pin}.commit"))
+              if not commit:
+                  raise ErrorLock(f"{pin}: `commit` no es `sha1-` más 40 hex en minúscula", linea)
+              ids = []
+              for k in ("owner_id", "repo_id"):
+                  v = c[k]
+                  if not (isinstance(v, yaml.ScalarNode) and v.style is None
+                          and re.fullmatch(r"[1-9][0-9]{0,17}", v.value)):
+                      raise ErrorLock(f"{pin}: `{k}` no es un entero positivo", linea)
+                  ids.append(int(v.value))
+              ref_clave = pin.split("@", 1)[1]
+              if SHA_COMPLETO.fullmatch(ref_clave):
+                  if ref_clave != commit.group(1):
+                      raise ErrorLock(f"{pin}: la clave fija un SHA y `commit` otro ({commit.group(1)[:12]})", linea)
+              elif ref != ref_clave:
+                  raise ErrorLock(f"{pin}: `ref: {ref}` no es el ref de la clave", linea)
+              usa = _pines(c["uses"], f"{pin}.uses") if "uses" in c else ()
+              return Entrada(ref, commit.group(1), ids[0], ids[1], usa)
+
+
+          def leer_lock(texto):
+              """El lockfile como datos verificables. Esquema cerrado; si no, ErrorLock."""
+              _sin_trucos(texto)
+              raiz, error, linea = leer_yaml(texto)
+              if error:
+                  raise ErrorLock(error, linea)
+              if raiz is None:
+                  raise ErrorLock("está vacío")
+              top = _mapa(raiz, "raíz", ("version", "workflows", "dependencies"))
+              version = _texto(top["version"][1], "version") if "version" in top else None
+              if version != LOCK_VERSION:
+                  raise ErrorLock(f"versión `{version}`: este check solo entiende {LOCK_VERSION}")
+              lock = {"workflows": {}, "deps": {}, "lineas": {}}
+              if "dependencies" in top:
+                  for clave, (n, v) in _mapa(top["dependencies"][1], "dependencies").items():
+                      pin = pin_canonico(clave)
+                      if pin is None:
+                          raise ErrorLock(f"la clave `{clave}` no es `dueño/repo@ref`", n)
+                      if pin in lock["deps"]:
+                          raise ErrorLock(f"{pin}: entrada repetida (cambian las mayúsculas)", n)
+                      lock["deps"][pin] = _entrada(pin, v, n)
+                      lock["lineas"][pin] = n
+              listas = []
+              if "workflows" in top:
+                  for ruta, (n, v) in _mapa(top["workflows"][1], "workflows").items():
+                      lock["workflows"][ruta] = _pines(v, f"workflows[{ruta}]")
+                      listas.append((ruta, lock["workflows"][ruta], n))
+              listas += [(pin, e.uses, lock["lineas"][pin]) for pin, e in lock["deps"].items()]
+              for quien, pines, n in listas:
+                  colgando = next((p for p in pines if p not in lock["deps"]), None)
+                  if colgando:
+                      raise ErrorLock(f"{quien} lista `{colgando}`, que no tiene entrada en `dependencies`", n)
+              return lock
+
+
+          def cierre(lock, pines):
+              """Los pines y todo lo que arrastran por `uses` (dependencias transitivas)."""
+              vistos, pila = set(), list(pines)
+              while pila:
+                  pin = pila.pop()
+                  if pin not in vistos:
+                      vistos.add(pin)
+                      pila += lock["deps"][pin].uses
+              return vistos
+
+
+          def cubierto(lock, ruta, pin):
+              return lock is not None and pin in lock["workflows"].get(ruta, ())
+
+
           # ------------------------------------------------------- verificación
 
           class Verificador:
@@ -436,6 +679,14 @@ jobs:
                   self._alcance = {}
                   self._tags = {}
                   self._lista_tags = {}
+                  self._repos = {}
+                  self._entradas = {}
+
+              def repo(self, dueno, repo):
+                  clave = (dueno.lower(), repo.lower())
+                  if clave not in self._repos:
+                      self._repos[clave] = api(f"repos/{dueno}/{repo}")
+                  return self._repos[clave]
 
               def contiene(self, repo, rama, sha):
                   st, d = api(f"repos/{repo}/compare/{urllib.parse.quote(rama, safe='/')}...{sha}?per_page=1")
@@ -448,7 +699,7 @@ jobs:
                   return self._alcance[clave]
 
               def _alcanzable(self, dueno, repo, sha):
-                  st, info = api(f"repos/{dueno}/{repo}")
+                  st, info = self.repo(dueno, repo)
                   if st != 200:
                       return f"no se pudo leer el repo {dueno}/{repo} (HTTP {st}): sin verificar no entra"
                   full, rama_def = info["full_name"], info["default_branch"]
@@ -533,7 +784,72 @@ jobs:
                               f"{existe[1][:12]}, no a {sha[:12]}")
                   return f"el comentario dice {v}, pero ese tag no existe en {full}"
 
-              def revisar_uso(self, ruta, uso, lineas):
+              def tag_del_ref(self, full, ref, sha):
+                  """El `@ref` de un lockfile dice la verdad: tag de versión que apunta a ese commit."""
+                  if not TAG_RE.fullmatch(ref):
+                      return (f"`@{ref}` no es un tag de versión (rama u otra ref): "
+                              "usa un tag de release `vX.Y.Z`")
+                  t = self.tag_commit(full, ref)
+                  if t == sha:
+                      return None
+                  # `@v7` (solo mayor): igual que `# v7` en un pin por SHA.
+                  if re.fullmatch(r"v?\d+", ref) and any(
+                          n.startswith(ref + ".") and s == sha for n, s in self.tags_de(full).items()):
+                      return None
+                  if t:
+                      return (f"el tag {ref} apunta a {t[:12]} y el lockfile fija {sha[:12]}: "
+                              "tag movido o lockfile desactualizado")
+                  return f"el tag {ref} no existe en {full}"
+
+              def entrada(self, pin, e):
+                  """Motivo de rojo de una entrada del lockfile, o None."""
+                  if (pin, e) not in self._entradas:
+                      self._entradas[(pin, e)] = self._revisar_entrada(pin, e)
+                  return self._entradas[(pin, e)]
+
+              def _revisar_entrada(self, pin, e):
+                  nwo, ref = pin.split("@", 1)
+                  dueno, repo = nwo.split("/")
+                  st, info = self.repo(dueno, repo)
+                  if st != 200:
+                      return f"no se pudo leer el repo {nwo} (HTTP {st}): sin verificar no entra"
+                  full = info["full_name"]
+                  if full.lower() != nwo:
+                      return f"{nwo} hoy es {full} (renombrado o transferido): usa el nombre actual"
+                  if (info["owner"]["id"], info["id"]) != (e.owner_id, e.repo_id):
+                      return f"owner_id/repo_id no son los de {full} (repo reemplazado o lockfile alterado)"
+                  motivo = self.alcanzable(dueno, repo, e.commit)
+                  if motivo or SHA_COMPLETO.fullmatch(ref):
+                      return motivo
+                  return self.tag_del_ref(full, ref, e.commit)
+
+              def por_lockfile(self, ruta, partes, lock, nota_lock, en_paso):
+                  """`uses` sin SHA completo: motivo de rojo, o None si el lockfile lo respalda."""
+                  dueno, repo, sub, ref = partes
+                  base = f"no está fijado por SHA completo (`@{ref}`)"
+                  if SHA_COMPLETO.fullmatch(ref):
+                      return base
+                  if not es_workflow(ruta):
+                      return base + ": `actions.lock` solo respalda pasos de workflows; en un action.yml fija el SHA"
+                  if not en_paso or es_reusable(sub):
+                      return base + ": `actions.lock` no fija workflows reusables (`jobs.<id>.uses`)"
+                  if lock is None:
+                      return base + (f" y `actions.lock` no se puede usar: {nota_lock}" if nota_lock
+                                     else " y el repo no tiene `actions.lock`")
+                  pin = pin_canonico(f"{dueno}/{repo}@{ref}")
+                  if not cubierto(lock, ruta, pin):
+                      return base + " y `actions.lock` no tiene su entrada para este workflow (`gh actions-lock`)"
+                  return self.lo_que_fija(lock, pin)
+
+              def lo_que_fija(self, lock, pin):
+                  """Motivo de rojo en la entrada `pin` o en algo que arrastra, o None."""
+                  for p in sorted(cierre(lock, [pin])):
+                      motivo = self.entrada(p, lock["deps"][p])
+                      if motivo:
+                          return f"`actions.lock` fija {p} en {lock['deps'][p].commit[:12]}: {motivo}"
+                  return None
+
+              def revisar_uso(self, ruta, uso, lineas, lock=None, nota_lock=None, en_paso=False):
                   n0 = lineas[0][0]
                   # `$/` = acción local en la sintaxis de los lockfiles (`gh actions-lock`).
                   if uso.startswith(("./", "$/")):
@@ -550,10 +866,16 @@ jobs:
                   if any(s in (".", "..", "") for s in sub.split("/")[1:]):
                       return [hallazgo("error", ruta, n0, uso, "subruta con `.`, `..` o `//`: escríbela canónica")]
                   if not SHA_RE.fullmatch(ref):
-                      return [hallazgo("error", ruta, n0, uso,
-                                       f"no está fijado por SHA completo (`@{ref}`)")]
+                      motivo = self.por_lockfile(ruta, m.groups(), lock, nota_lock, en_paso)
+                      return [hallazgo("error", ruta, n0, uso, motivo)] if motivo else []
                   out = []
                   motivo = self.alcanzable(dueno, repo, ref)
+                  pin = pin_canonico(f"{dueno}/{repo}@{ref}")
+                  if not motivo and not es_reusable(sub) and lock is not None and pin in lock["deps"]:
+                      # Al volver a usarlo, el runner corre lo que el lockfile le cuelga
+                      # (también desde un action.yml local): se verifica de nuevo. Un
+                      # reusable no: sus dependencias las fija el lockfile de su repo.
+                      motivo = self.lo_que_fija(lock, pin)
                   if motivo:
                       out.append(hallazgo("error", ruta, n0, uso, motivo))
                   for n, linea in lineas:
@@ -567,8 +889,8 @@ jobs:
               return {"nivel": nivel, "ruta": ruta, "linea": linea, "uso": uso, "motivo": motivo}
 
 
-          def revisar_archivo(ruta, base_txt, head_txt, verif):
-              """(hallazgos, líneas donde aparece algún par nuevo)."""
+          def revisar_archivo(ruta, base_txt, head_txt, verif, lock=None, nota_lock=None):
+              """(hallazgos, líneas donde aparece algún par nuevo). `lock` = el de head."""
               import yaml
               raiz, error, linea = leer_yaml(head_txt)
               if error:
@@ -582,6 +904,7 @@ jobs:
                                    if lfs else "no es un workflow ni una acción (la raíz no es un mapa)")], set()
               raiz_base = leer_yaml(base_txt)[0] if base_txt else None
               previos = {u for u in usos(raiz_base) if isinstance(u, str)}
+              fuera = usos_fuera_de_pasos(raiz)
               lineas = head_txt.splitlines()
               nuevas = sorted(lineas_nuevas(base_txt, head_txt))
               out, vistos, de_pares_nuevos = [], set(), set()
@@ -606,8 +929,81 @@ jobs:
                                           "(escape, alias o multilínea): escríbelo en una sola línea"))
                       continue
                   de_pares_nuevos.update(n for n, _ in donde)
-                  out += verif.revisar_uso(ruta, uso, donde)
+                  out += verif.revisar_uso(ruta, uso, donde, lock, nota_lock, uso not in fuera)
               return out, de_pares_nuevos
+
+
+          def cargar_lock(repo, sha):
+              """(lock, None) · (None, None) si no hay · (None, motivo) si no se puede usar."""
+              if not sha:
+                  return None, None
+              try:
+                  return leer_lock(blob(repo, sha)), None
+              except UnicodeDecodeError:
+                  return None, "no es UTF-8"
+              except ErrorLock as e:
+                  return None, (f"línea {e.linea}: " if e.linea else "") + str(e)
+
+
+          def revisar_entradas(base, head, verif):
+              """Entradas que el cambio activa: nuevas, cambiadas y las que un workflow
+              empieza a usar, todas con lo que arrastran (una relación `uses` nueva
+              activa una entrada que no cambió). `base` None: todo es nuevo."""
+              previas = base["deps"] if base else {}
+              tocadas = {pin for pin, e in head["deps"].items() if previas.get(pin) != e}
+              for ruta, pines in head["workflows"].items():
+                  antes = set(base["workflows"].get(ruta, ())) if base else set()
+                  tocadas |= set(pines) - antes
+              out = []
+              for pin in sorted(cierre(head, tocadas)):
+                  motivo = verif.entrada(pin, head["deps"][pin])
+                  if motivo:
+                      out.append(hallazgo("error", LOCK_RUTA, head["lineas"][pin], pin, motivo))
+              return out
+
+
+          def revisar_cobertura(ruta, head_txt, base, base_roto, head):
+              """`uses` con tag que el cambio de lockfile deja sin entrada.
+
+              `base_roto`: había lockfile pero no se puede leer; no se sabe qué cubría,
+              así que todo tag de head debe quedar cubierto.
+              """
+              raiz, error, linea = leer_yaml(head_txt)
+              if error:
+                  return [hallazgo("error", ruta, linea, None,
+                                   f"no se puede comprobar su cobertura en `actions.lock`: {error}")]
+              out = []
+              lineas = head_txt.splitlines()
+              for uso in sorted({u for u in usos(raiz) if isinstance(u, str)}):
+                  pin = pin_de_uso(uso)
+                  if pin and (base_roto or cubierto(base, ruta, pin)) and not cubierto(head, ruta, pin):
+                      n = next((i for i, texto in enumerate(lineas, 1) if aparece(uso, texto)), None)
+                      out.append(hallazgo("error", ruta, n, uso,
+                                          "el cambio en `actions.lock` deja este `uses` sin entrada"))
+              return out
+
+
+          def revisar_cambio_lock(repo, base_wfs, head_wfs, head, nota_head, verif):
+              """Hallazgos de un `actions.lock` agregado, modificado o borrado."""
+              base, nota_base = cargar_lock(repo, base_wfs.get(LOCK_RUTA))
+              out = []
+              if nota_head:
+                  out.append(hallazgo("error", LOCK_RUTA, None, None, nota_head))
+              if head:
+                  out += revisar_entradas(base, head, verif)
+              if nota_base:
+                  rutas = [r for r in head_wfs if es_workflow(r)]
+              else:
+                  rutas = [r for r, pines in (base["workflows"] if base else {}).items()
+                           if r in head_wfs and any(not cubierto(head, r, p) for p in pines)]
+              for ruta in sorted(rutas):
+                  try:
+                      texto = blob(repo, head_wfs[ruta])
+                  except UnicodeDecodeError:
+                      out.append(hallazgo("error", ruta, None, None, "archivo que no es UTF-8"))
+                      continue
+                  out += revisar_cobertura(ruta, texto, base, bool(nota_base), head)
+              return out
 
 
           # ------------------------------------------------------------- zizmor
@@ -715,17 +1111,23 @@ jobs:
                   base, head = shas_del_evento(repo)
                   print(f"base {base} · head {head}")
                   cambios, prohibidos = detectar(repo, base, head)
+                  base_wfs, head_wfs = workflows_en(repo, base), workflows_en(repo, head)
+                  cambio_lock = base_wfs.get(LOCK_RUTA) != head_wfs.get(LOCK_RUTA)
                   hallazgos = [hallazgo("error", r, None, None,
                                         f"{tipo} en una ruta de workflows o acciones: no se permite "
                                         "(el contenido real queda fuera de la verificación)")
                                for r, tipo in prohibidos]
-                  if not cambios:
+                  if not cambios and not cambio_lock:
                       if not hallazgos:
-                          resumen("## verificar-acciones — VERDE\n\nSin cambios en workflows ni en action.yml.")
+                          resumen("## verificar-acciones — VERDE\n\n"
+                                  "Sin cambios en workflows, action.yml ni actions.lock.")
                           return 0
                       return 1 if informar(hallazgos, 0) else 0
                   instalar()
                   verif = Verificador()
+                  lock, nota_lock = cargar_lock(repo, head_wfs.get(LOCK_RUTA))
+                  if cambio_lock:
+                      hallazgos += revisar_cambio_lock(repo, base_wfs, head_wfs, lock, nota_lock, verif)
                   with tempfile.TemporaryDirectory() as carpeta:
                       for c in cambios:
                           try:
@@ -734,10 +1136,11 @@ jobs:
                           except UnicodeDecodeError:
                               hallazgos.append(hallazgo("error", c["ruta"], None, None, "archivo que no es UTF-8"))
                               continue
-                          propios, de_pares_nuevos = revisar_archivo(c["ruta"], base_txt, head_txt, verif)
+                          propios, de_pares_nuevos = revisar_archivo(c["ruta"], base_txt, head_txt, verif,
+                                                                     lock, nota_lock)
                           hallazgos += propios
                           hallazgos += revisar_zizmor(c["ruta"], head_txt, carpeta, de_pares_nuevos)
-                  return 1 if informar(hallazgos, len(cambios)) else 0
+                  return 1 if informar(hallazgos, len(cambios) + cambio_lock) else 0
               except (ErrorApi, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                   print(f"::error title=verificar-acciones::{_dato(f'no se pudo verificar, sin verificar no entra: {e}')}")
                   return 1

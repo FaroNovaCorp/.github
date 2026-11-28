@@ -46,7 +46,9 @@
 | F4 | Defensa 2: `/cambios-criticos` semanal con verificación upstream | 25-nov | Completada · patrón 8; texto con llave (registro #174) |
 | F5.1 | Lockfiles: medición en seco por repo (`gh actions-lock --no-fix`) | 26-nov | Completada · informe SHP3 (`scratch/maestra-28jul-coord/reportes/SHP3-lockfiles-en-seco.md`) |
 | F5.2 | Política «Require lockfile» en Evaluate (org) | 27-nov | Completada · política de Actions 18025, Evaluate, 18 repos por `repository_id`; informe SHP4 |
-| F5.3 | Onboarding: `actions.lock` por repo, `.github` primero; 18 repos | 1-dic a 5-dic | Pendiente · antes, decisión de David sobre el choque A (SHP4 § «Decisión F5.3 · choque A») |
+| F5.3a | `verificar-acciones` lee `actions.lock` (choque A, opción a · D-3713) | 27-nov | Completada · PR de la rama `feat/shp5-p-1047-check-lee-lockfile`; informe SHP5. No rige hasta F5.3b |
+| F5.3b | Owner (David o Raúl) mueve el `sha` del ruleset 28092239 al merge de F5.3a; prueba en vivo | antes del 1-dic | Pendiente |
+| F5.3c | Onboarding: `actions.lock` por repo, `.github` primero; 18 repos | 1-dic a 5-dic | Pendiente · espera F5.3b |
 | F5.4 | «Require lockfile» a Active | 12-dic | Pendiente |
 
 Archivos:
@@ -68,7 +70,20 @@ Cabos sueltos (27-nov):
 - Policy insights: cada run de los 18 sale «Evaluate · Would block» con el archivo del workflow. Sin ver aún: `pull_request`, `merge_group`, `schedule`, Dependabot.
 - Choque A (`verificar-acciones` vs `@vX` de `gh actions-lock`): decide David antes del 1-dic; opciones y recomendación en `scratch/maestra-28jul-coord/reportes/SHP4-lockfile-evaluate.md`.
 - Deshacer F5.2: Disabled en la página, o `gh api -X DELETE orgs/FaroNovaCorp/actions/policies/18025`.
-- Siguiente sesión: arrancar por la decisión del choque A, luego F5.3.
+- Siguiente sesión: arrancar por la decisión del choque A, luego F5.3. (Cerrado: decidido y hecho en F5.3a.)
+
+Cabos sueltos (27-nov, F5.3a):
+- Choque A: David, D-3713: «Respecto a lo que dices de GitHub, vamos con la más segura, por favor» → opción a.
+- Antes de mover el `sha` (F5.3b): 0 `actions.lock` en `main` de los repos del ruleset y 0 PRs abiertos que lo toquen. El check viejo no mira el lockfile y el nuevo solo verifica entradas nuevas, cambiadas o activadas. Guion: `scratch/maestra-28jul-coord/reportes/SHP5-anexos/mover-sha-ruleset.sh`.
+- Prueba en vivo antes de mover el `sha` (28-nov, `ensayo-identidad-app`, copia del check nuevo como workflow aparte, zizmor real; ambos cerrados sin mergear, ramas borradas): #14 incorporación con `gh actions-lock` → nuevo VERDE, el de la regla (`c10094c`) ROJO por `@v7.0.1`; #15 solo `actions.lock` con `commit` de fork → nuevo ROJO.
+- Después de F5.3b, en `ensayo-identidad-app`: PR con lockfile legítimo → verde; PR que solo cambia el `commit` del lockfile a uno de fork → BLOCKED. Cerrar ambos sin mergear.
+- Simulación del 27-nov (`gh actions-lock` v0.5.1 en clones desechables, API real, zizmor simulado): la incorporación de los 18 repos sale verde con el check nuevo; `agente-de-monitoreo` con `--migrate-local-actions`.
+- La defensa 2 queda ciega con el onboarding: `cambios-criticos-upstream.py` solo lee `@<sha40>` y no lee `actions.lock`. Enseñarle el lockfile antes de cerrar F5.3c.
+- El check solo entiende lockfile `v0.0.3` y sus campos conocidos. Si GitHub (CLI o Dependabot) cambia el formato → rojo con su motivo; se actualiza aquí y se mueve el `sha`.
+- Sin probar: un PR real de Dependabot con lockfile (formato que escribe).
+- Onboarding: los workflows y `action.yml` conservan SHA donde el lockfile no fija (`jobs.<id>.uses`, acciones compuestas locales).
+- El check no exige entrada para un paso por SHA en un workflow incorporado: la completitud la cubre el workflow `verify` de la extensión (SHP3 § F5.3, punto 6); añadirlo en F5.3c.
+- Revisión F5.3a: 4 rondas, Claude y Codex APROBADO · `evaluaciones/ejecucion/2026-11-28-revision-headless-f53a.md`.
 
 ## Contexto
 
@@ -137,7 +152,13 @@ Secundarios:
 
 - F5.1 · 26-nov · `gh actions-lock --no-fix` en cada repo, en seco: errores, acciones locales `./`, reusables.
 - F5.2 · 27-nov · «Require lockfile» en Evaluate, org, los 18 repos activos con workflows, por lista explícita (interfaz: Settings → Actions → Policies; navegador con el aviso de David).
-- F5.3 · 1-dic a 5-dic · `actions.lock` por repo; `.github` primero (sus reusables deben estar onboarded antes que los que los llaman). Dependabot regenera las entradas.
+- F5.3a · `verificar-acciones` acepta `uses: dueño/repo@vX` solo si `.github/workflows/actions.lock` lo respalda:
+  - paso de un job (no `jobs.<id>.uses`, no `action.yml`: ahí sigue el SHA);
+  - entrada para ese workflow; `commit` de 40 alcanzable desde una rama del dueño (mismo criterio); tag de versión que apunta a ese commit (`@vN`: algún `vN.x`); `owner_id`/`repo_id` del repo; igual para sus transitivas;
+  - lockfile cambiado, aunque ningún workflow cambie: entradas nuevas, cambiadas o activadas se verifican; quitar la entrada de un tag que sigue → rojo;
+  - formato cerrado `v0.0.3`.
+- F5.3b · mover el `sha` del ruleset 28092239 (owner). Deshacer: el mismo guion con el `sha` anterior (`c10094cd7a1f56e5f8578ca2135b3c5a27d12efe`).
+- F5.3c · 1-dic a 5-dic · `actions.lock` por repo; `.github` primero (sus reusables deben estar onboarded antes que los que los llaman). Dependabot regenera las entradas.
 - F5.4 · 12-dic · Active, tras 7 días de Policy insights sin «would block».
 
 ## Criterios de Exito
