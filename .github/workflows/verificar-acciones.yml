@@ -135,6 +135,7 @@ jobs:
           SHA_COMPLETO = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
           PIN_RE = re.compile(
               r"([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)@([A-Za-z0-9._+/-]+)")
+          REUSABLE_RE = re.compile(r"/\.github/workflows/[^/]+\.ya?ml")
           # Ref que un lockfile puede respaldar: tag de versión (`v4`, `v7.0.1`, `1.2.3-rc.1`).
           TAG_RE = re.compile(r"v?\d+(?:\.\d+)*(?:-[0-9A-Za-z][0-9A-Za-z.]*)?")
           Entrada = collections.namedtuple("Entrada", "ref commit owner_id repo_id uses")
@@ -524,8 +525,10 @@ jobs:
 
 
           def es_reusable(subruta):
-              """`dueño/repo/…/x.yml@ref`: llamada a un workflow, no una acción."""
-              return subruta.lower().endswith((".yml", ".yaml"))
+              """Llamada a un workflow y no a una acción. La regla de GitHub: un YAML
+              directo bajo `.github/workflows/`. Un directorio de acción puede
+              llamarse `x.yml`: ese es una acción."""
+              return REUSABLE_RE.fullmatch(subruta) is not None
 
 
           def pin_de_uso(uso):

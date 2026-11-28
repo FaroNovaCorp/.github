@@ -675,8 +675,10 @@ class TestLockfile(Base):
             "  b:\n"
             f"    uses: FaroNovaCorp/.github/.github/workflows/secret-scan.yml@{PROPIO_OK}\n")
         self.assertEqual(self.con_lock(head, lock), [])
-        paso = wf(f"      - uses: FaroNovaCorp/.github/accion@{PROPIO_OK}\n")
-        self.rojo(self.con_lock(paso, lock), "no está en ninguna rama de oven-sh/setup-bun")
+        # Todo lo demás es una acción, aunque el directorio se llame `x.yml`.
+        for ruta in ("accion", "accion.yml", "accion.yaml", ".github/workflows/dir/x.yml", "x.yml/sub"):
+            paso = wf(f"      - uses: FaroNovaCorp/.github/{ruta}@{PROPIO_OK}\n")
+            self.rojo(self.con_lock(paso, lock), "no está en ninguna rama de oven-sh/setup-bun")
 
     def test_paso_por_sha_malo_con_entrada_no_repite_el_error(self):
         pin = f"actions/checkout@{IMPOSTOR}"
