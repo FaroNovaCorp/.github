@@ -75,6 +75,7 @@ Cabos sueltos (27-nov):
 Cabos sueltos (27-nov, F5.3a):
 - Choque A: David, D-3713: «Respecto a lo que dices de GitHub, vamos con la más segura, por favor» → opción a.
 - Antes de mover el `sha` (F5.3b): 0 `actions.lock` en `main` de los repos del ruleset y 0 PRs abiertos que lo toquen. El check viejo no mira el lockfile y el nuevo solo verifica entradas nuevas, cambiadas o activadas. Guion: `scratch/maestra-28jul-coord/reportes/SHP5-anexos/mover-sha-ruleset.sh`.
+- Prueba en vivo antes de mover el `sha` (28-nov, `ensayo-identidad-app`, copia del check nuevo como workflow aparte, zizmor real; ambos cerrados sin mergear, ramas borradas): #14 incorporación con `gh actions-lock` → nuevo VERDE, el de la regla (`c10094c`) ROJO por `@v7.0.1`; #15 solo `actions.lock` con `commit` de fork → nuevo ROJO.
 - Después de F5.3b, en `ensayo-identidad-app`: PR con lockfile legítimo → verde; PR que solo cambia el `commit` del lockfile a uno de fork → BLOCKED. Cerrar ambos sin mergear.
 - Simulación del 27-nov (`gh actions-lock` v0.5.1 en clones desechables, API real, zizmor simulado): la incorporación de los 18 repos sale verde con el check nuevo; `agente-de-monitoreo` con `--migrate-local-actions`.
 - La defensa 2 queda ciega con el onboarding: `cambios-criticos-upstream.py` solo lee `@<sha40>` y no lee `actions.lock`. Enseñarle el lockfile antes de cerrar F5.3c.

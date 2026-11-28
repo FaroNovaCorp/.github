@@ -50,5 +50,11 @@ Razón del tercero (dueño del cambio): encargo «líneas `@<sha40>` sin lockfil
 ## Límites aceptados
 - No se compara el grafo transitivo del lockfile con el `action.yml` de cada acción.
 - Entradas anteriores a F5.3b no se verifican hasta que se activan: precondición 0 `actions.lock` al mover el `sha`.
-- Semántica del runner: tomada de la documentación de GitHub, sin prueba en vivo.
-- zizmor y un PR real con lockfile: sin probar hasta F5.3b.
+- Semántica del runner (qué corre con lockfile): tomada de la documentación de GitHub, sin prueba en vivo.
+- Sin probar: un PR real de Dependabot con lockfile.
+
+## Prueba en vivo (28-nov, tras la ronda 4)
+- Copia del check nuevo como workflow aparte en `ensayo-identidad-app`, zizmor real.
+- #14, incorporación hecha por `gh actions-lock`: nuevo VERDE (3 archivos, 0 errores, 0 avisos); regla de la org (`c10094c`) ROJO por `@v7.0.1`.
+- #15, solo `actions.lock` con commit de fork: nuevo ROJO («no está en ninguna rama de actions/checkout»), anotado en la línea de la entrada.
+- Ambos cerrados sin mergear; ramas borradas; `main` sin cambio.
