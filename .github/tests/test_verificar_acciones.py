@@ -653,6 +653,25 @@ class TestLockfile(Base):
         lock = lockfile([dep(V701, LEGIT, usa=[malo]), dep(malo, BUN_FORK, ref="v2.2.0")])
         self.rojo(self.con_lock(a_tag(base_wf()), lock), "no está en ninguna rama de oven-sh/setup-bun")
 
+    def test_paso_por_sha_nuevo_verifica_lo_que_el_lockfile_le_cuelga(self):
+        # La entrada entró cuando todo estaba en una rama; al volver a usar la
+        # acción, su transitiva ya no lo está.
+        pin, hijo = f"actions/checkout@{LEGIT}", f"oven-sh/setup-bun@{BUN_FORK}"
+        lock = lockfile([dep(pin, LEGIT, ref="v7.0.1", usa=[hijo]), dep(hijo, BUN_FORK, ref="v2.2.0")])
+        paso = wf(f"      - uses: actions/checkout/sub@{LEGIT} # v7.0.1\n")
+        self.rojo(self.con_lock(paso, lock), "no está en ninguna rama de oven-sh/setup-bun")
+        accion = ("name: a\ndescription: a\nruns:\n  using: composite\n  steps:\n"
+                  f"    - uses: actions/checkout@{LEGIT} # v7.0.1\n")
+        errs = self.con_lock(accion, lock, base="", ruta=".github/actions/a/action.yml")
+        self.rojo(errs, "no está en ninguna rama de oven-sh/setup-bun")
+
+    def test_paso_por_sha_malo_con_entrada_no_repite_el_error(self):
+        pin = f"actions/checkout@{IMPOSTOR}"
+        lock = lockfile([dep(pin, IMPOSTOR, ref="v7.0.1")])
+        head = wf(f"      - uses: actions/checkout/sub@{IMPOSTOR} # v7\n")
+        motivos = [e["motivo"] for e in self.con_lock(head, lock)]
+        self.assertEqual(sum("no está en ninguna rama" in m for m in motivos), 1, motivos)
+
     def test_transitiva_de_segundo_nivel_con_tag_mentiroso(self):
         lock = lockfile([dep(V701, LEGIT, usa=["oven-sh/setup-bun@v2"]),
                          dep("oven-sh/setup-bun@v2", BUN, usa=["actions/checkout@v7.0.2"]),
@@ -1099,6 +1118,15 @@ class TestMainLock(Base):
         base = {**self.TAG, LOCK: lockfile([dep(V701, LEGIT, usa=[hijo]), dep(hijo, BUN)])}
         head = {**base, LOCK: lockfile([dep(V701, LEGIT, usa=[hijo]), dep(hijo, BUN_FORK)])}
         self.assertEqual(self.correr(base, head), 1, self.salida)
+
+    def test_relacion_uses_nueva_verifica_el_destino_que_no_cambio(self):
+        hijo = f"oven-sh/setup-bun@{BUN_FORK}"
+        entrada_hijo = dep(hijo, BUN_FORK, ref="v2.2.0")
+        base = {**self.TAG, LOCK: lockfile([dep(V701, LEGIT), entrada_hijo])}
+        head = {**base, LOCK: lockfile([dep(V701, LEGIT, usa=[hijo]), entrada_hijo])}
+        for evento in ("pull_request", "merge_group"):
+            self.assertEqual(self.correr(base, head, evento=evento), 1, self.salida)
+            self.assertIn("no está en ninguna rama de oven-sh/setup-bun", self.salida)
 
     def test_bump_de_dependabot_pasa(self):
         lock = lockfile([dep("actions/checkout@v7.0.2", NUEVO)])

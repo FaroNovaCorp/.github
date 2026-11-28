@@ -29,7 +29,9 @@ name: verificar-acciones
 #   `uses: ./…`: revisión del PR y /cambios-criticos. «Repo de la org en main»
 #   incluye los 4 repos sin flujo de PR, que quedan fuera del ruleset. No
 #   compara el grafo transitivo del lockfile con el action.yml de cada acción
-#   (eso lo hace `gh actions-lock --verify`). Una acción de terceros que por
+#   (eso lo hace `gh actions-lock --verify`). Tampoco exige entrada para un
+#   paso por SHA de un workflow incorporado: el código lo fija la línea; según
+#   la doc, si falta la entrada falla el runner. Una acción de terceros que por
 #   dentro use una rama, o un commit que ya no está en ninguna rama, da rojo
 #   (27-nov: 0 casos en las entradas de los 18 repos).
 # Plan: docs/planes-de-trabajo/pendientes/proteccion-commits-impostores/plan.md
@@ -90,8 +92,10 @@ jobs:
             Sin entrada → rojo. Reusables (`jobs.<id>.uses`) y action.yml: el
             lockfile no los fija; exigen SHA.
           - Lockfile cambiado, aunque ningún workflow cambie: se verifica cada
-            entrada nueva, cambiada o que un workflow empieza a usar. Quitar la
-            entrada de un `uses` con tag que sigue → rojo.
+            entrada nueva, cambiada o que un workflow empieza a usar, con lo que
+            arrastra. Quitar la entrada de un `uses` con tag que sigue → rojo.
+          - Un par por SHA nuevo con entrada en el lockfile: también se verifica
+            lo que la entrada arrastra.
           - Formato cerrado (lo que no se entiende no entra): ASCII sin anclas,
             alias, etiquetas ni barras invertidas; solo campos conocidos (sin
             `hostname`); grafo sin entradas colgando.
@@ -827,6 +831,10 @@ jobs:
                   pin = pin_canonico(f"{dueno}/{repo}@{ref}")
                   if not cubierto(lock, ruta, pin):
                       return base + " y `actions.lock` no tiene su entrada para este workflow (`gh actions-lock`)"
+                  return self.lo_que_fija(lock, pin)
+
+              def lo_que_fija(self, lock, pin):
+                  """Motivo de rojo en la entrada `pin` o en algo que arrastra, o None."""
                   for p in sorted(cierre(lock, [pin])):
                       motivo = self.entrada(p, lock["deps"][p])
                       if motivo:
@@ -854,6 +862,11 @@ jobs:
                       return [hallazgo("error", ruta, n0, uso, motivo)] if motivo else []
                   out = []
                   motivo = self.alcanzable(dueno, repo, ref)
+                  pin = pin_canonico(f"{dueno}/{repo}@{ref}")
+                  if not motivo and lock is not None and pin in lock["deps"]:
+                      # Al volver a usarlo, el runner corre lo que el lockfile le cuelga
+                      # (también desde un action.yml local): se verifica de nuevo.
+                      motivo = self.lo_que_fija(lock, pin)
                   if motivo:
                       out.append(hallazgo("error", ruta, n0, uso, motivo))
                   for n, linea in lineas:
@@ -924,15 +937,16 @@ jobs:
 
 
           def revisar_entradas(base, head, verif):
-              """Entradas que el cambio activa: nuevas o cambiadas, y las que un workflow
-              empieza a usar (con lo que arrastran). `base` None: todo es nuevo."""
+              """Entradas que el cambio activa: nuevas, cambiadas y las que un workflow
+              empieza a usar, todas con lo que arrastran (una relación `uses` nueva
+              activa una entrada que no cambió). `base` None: todo es nuevo."""
               previas = base["deps"] if base else {}
-              revisar = {pin for pin, e in head["deps"].items() if previas.get(pin) != e}
+              tocadas = {pin for pin, e in head["deps"].items() if previas.get(pin) != e}
               for ruta, pines in head["workflows"].items():
                   antes = set(base["workflows"].get(ruta, ())) if base else set()
-                  revisar |= cierre(head, set(pines) - antes)
+                  tocadas |= set(pines) - antes
               out = []
-              for pin in sorted(revisar):
+              for pin in sorted(cierre(head, tocadas)):
                   motivo = verif.entrada(pin, head["deps"][pin])
                   if motivo:
                       out.append(hallazgo("error", LOCK_RUTA, head["lineas"][pin], pin, motivo))
