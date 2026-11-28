@@ -81,6 +81,8 @@ Cabos sueltos (27-nov, F5.3a):
 - El check solo entiende lockfile `v0.0.3` y sus campos conocidos. Si GitHub (CLI o Dependabot) cambia el formato → rojo con su motivo; se actualiza aquí y se mueve el `sha`.
 - Sin probar: un PR real de Dependabot con lockfile (formato que escribe).
 - Onboarding: los workflows y `action.yml` conservan SHA donde el lockfile no fija (`jobs.<id>.uses`, acciones compuestas locales).
+- El check no exige entrada para un paso por SHA en un workflow incorporado: la completitud la cubre el workflow `verify` de la extensión (SHP3 § F5.3, punto 6); añadirlo en F5.3c.
+- Revisión F5.3a: 4 rondas, Claude y Codex APROBADO · `evaluaciones/ejecucion/2026-11-28-revision-headless-f53a.md`.
 
 ## Contexto
 
