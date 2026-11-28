@@ -665,6 +665,19 @@ class TestLockfile(Base):
         errs = self.con_lock(accion, lock, base="", ruta=".github/actions/a/action.yml")
         self.rojo(errs, "no está en ninguna rama de oven-sh/setup-bun")
 
+    def test_reusable_por_sha_no_arrastra_el_lockfile_del_llamador(self):
+        # Misma clave repo+SHA en el lockfile del llamador (por una acción de ese
+        # repo): el reusable resuelve lo suyo con el lockfile de SU repo.
+        pin, hijo = f"faronovacorp/.github@{PROPIO_OK}", f"oven-sh/setup-bun@{BUN_FORK}"
+        lock = lockfile([dep(pin, PROPIO_OK, ref="main", usa=[hijo]), dep(hijo, BUN_FORK, ref="v2.2.0")],
+                        {".github/workflows/otro.yml": [pin, hijo]})
+        head = base_wf() + (
+            "  b:\n"
+            f"    uses: FaroNovaCorp/.github/.github/workflows/secret-scan.yml@{PROPIO_OK}\n")
+        self.assertEqual(self.con_lock(head, lock), [])
+        paso = wf(f"      - uses: FaroNovaCorp/.github/accion@{PROPIO_OK}\n")
+        self.rojo(self.con_lock(paso, lock), "no está en ninguna rama de oven-sh/setup-bun")
+
     def test_paso_por_sha_malo_con_entrada_no_repite_el_error(self):
         pin = f"actions/checkout@{IMPOSTOR}"
         lock = lockfile([dep(pin, IMPOSTOR, ref="v7.0.1")])

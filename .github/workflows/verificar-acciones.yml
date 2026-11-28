@@ -30,8 +30,8 @@ name: verificar-acciones
 #   incluye los 4 repos sin flujo de PR, que quedan fuera del ruleset. No
 #   compara el grafo transitivo del lockfile con el action.yml de cada acción
 #   (eso lo hace `gh actions-lock --verify`). Tampoco exige entrada para un
-#   paso por SHA de un workflow incorporado: el código lo fija la línea; según
-#   la doc, si falta la entrada falla el runner. Una acción de terceros que por
+#   paso por SHA de un workflow incorporado: el código lo fija la línea; que el
+#   lockfile esté completo lo comprueba `--verify`. Una acción de terceros que por
 #   dentro use una rama, o un commit que ya no está en ninguna rama, da rojo
 #   (27-nov: 0 casos en las entradas de los 18 repos).
 # Plan: docs/planes-de-trabajo/pendientes/proteccion-commits-impostores/plan.md
@@ -523,6 +523,11 @@ jobs:
               return f"{m.group(1).lower()}/{m.group(2).lower()}@{m.group(3)}"
 
 
+          def es_reusable(subruta):
+              """`dueño/repo/…/x.yml@ref`: llamada a un workflow, no una acción."""
+              return subruta.lower().endswith((".yml", ".yaml"))
+
+
           def pin_de_uso(uso):
               """Pin de un `uses` sin SHA completo (la subruta no es parte del pin), o None."""
               m = USES_RE.fullmatch(uso)
@@ -823,7 +828,7 @@ jobs:
                       return base
                   if not es_workflow(ruta):
                       return base + ": `actions.lock` solo respalda pasos de workflows; en un action.yml fija el SHA"
-                  if not en_paso or sub.lower().endswith((".yml", ".yaml")):
+                  if not en_paso or es_reusable(sub):
                       return base + ": `actions.lock` no fija workflows reusables (`jobs.<id>.uses`)"
                   if lock is None:
                       return base + (f" y `actions.lock` no se puede usar: {nota_lock}" if nota_lock
@@ -863,9 +868,10 @@ jobs:
                   out = []
                   motivo = self.alcanzable(dueno, repo, ref)
                   pin = pin_canonico(f"{dueno}/{repo}@{ref}")
-                  if not motivo and lock is not None and pin in lock["deps"]:
+                  if not motivo and not es_reusable(sub) and lock is not None and pin in lock["deps"]:
                       # Al volver a usarlo, el runner corre lo que el lockfile le cuelga
-                      # (también desde un action.yml local): se verifica de nuevo.
+                      # (también desde un action.yml local): se verifica de nuevo. Un
+                      # reusable no: sus dependencias las fija el lockfile de su repo.
                       motivo = self.lo_que_fija(lock, pin)
                   if motivo:
                       out.append(hallazgo("error", ruta, n0, uso, motivo))
